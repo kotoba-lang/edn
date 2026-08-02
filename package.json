@@ -1,0 +1,10 @@
+{
+  "name": "@kotoba-lang/edn",
+  "private": true,
+  "scripts": {
+    "test": "nbb --classpath src:test -e \"(require '[clojure.test :as t] 'kotoba.lang.edn-test) (let [r (t/run-tests 'kotoba.lang.edn-test)] (.exit js/process (if (pos? (+ (:fail r) (:error r))) 1 0)))\""
+  },
+  "devDependencies": {
+    "nbb": "^1.3.204"
+  }
+}

@@ -1,0 +1,22 @@
+(ns kotoba.lang.canonical-document
+  (:export [encode-canonical decode-canonical roundtrip? main]))
+
+;; Kotoba-native structured-data storage codec. This is the compiler-owned,
+;; deterministic document encoding, not textual EDN. A future compiler
+;; document-edn-read operation will close that final textual compatibility gap.
+
+(defn encode-canonical [value :document] :string
+  (document-print value))
+
+(defn decode-canonical [text :string] :document
+  (document-read text))
+
+(defn roundtrip? [value :document] :bool
+  (document-equal? value (decode-canonical (encode-canonical value))))
+
+(defn main [] :i64
+  (let [value (document-map
+               :goal (document-string "migrate")
+               :attempt (document-i64 3)
+               :ready (document-bool true))]
+    (if (roundtrip? value) 42 1)))
