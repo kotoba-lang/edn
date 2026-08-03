@@ -8,13 +8,16 @@ Bounded EDN and canonical structured-document codecs for Kotoba applications.
   `write-string` for immediate replacement of direct `clojure.edn` and
   `cljs.reader` dependencies. Tagged literals, reader discard, and reader eval
   are forbidden. Bytes, depth, tokens, nodes, and strings are bounded.
-- `kotoba.lang.canonical-document` (`.kotoba`) provides the sovereign,
-  zero-capability codec for the compiler's bounded `:document` value.
+- `kotoba.lang.canonical-document` (`.kotoba`) provides sovereign,
+  zero-capability canonical storage and textual EDN codecs for the compiler's
+  bounded `:document` value.
 
-The compiler's current `document-read` / `document-print` format is canonical
-hex, not textual EDN. Textual EDN becomes Kotoba-source authority only after
-the compiler admits `document-edn-read` / `document-edn-print`; the boundary is
-recorded in `migration/bounded-edn-v1.edn`.
+`document-read` / `document-print` remain the canonical hexadecimal storage
+format. `document-edn-read` / `document-edn-print` own textual syntax for nil,
+booleans, i64/f64, strings, keywords, vectors, and keyword-keyed maps. Sets,
+lists, symbols, tags, discard forms, general map keys, and reader eval fail
+closed; the remaining compatibility boundary is recorded in
+`migration/bounded-edn-v1.edn`.
 
 ## Use
 

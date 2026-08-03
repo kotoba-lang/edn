@@ -14,11 +14,21 @@ if (web.kotobaArtifact.requiredCapabilities.length !== 0) {
 if (web.instantiateKotoba().main() !== 42n) {
   throw new Error("canonical document Web self-check mismatch");
 }
+const webInstance = web.instantiateKotoba();
+if (webInstance["write-string"](webInstance["read-string"]("{:b false, :a 1}")) !== "{:a 1 :b false}") {
+  throw new Error("textual EDN Web canonicalization mismatch");
+}
+let webDenied = false;
+try { webInstance["reject-tag"](); } catch (_) { webDenied = true; }
+if (!webDenied) throw new Error("textual EDN Web tag denial mismatch");
 
 const host = await import(pathToFileURL(path.resolve(hostPath)));
 const wasm = await host.instantiateKotoba(fs.readFileSync(path.resolve(wasmPath)));
 if (wasm.instance.exports.main() !== 42n) {
   throw new Error("canonical document Wasm self-check mismatch");
 }
+let wasmDenied = false;
+try { wasm.instance.exports["reject-tag"](); } catch (_) { wasmDenied = true; }
+if (!wasmDenied) throw new Error("textual EDN Wasm tag denial mismatch");
 
-console.log("edn: canonical document Web/Wasm conformance passed");
+console.log("edn: canonical + textual document Web/Wasm conformance passed");

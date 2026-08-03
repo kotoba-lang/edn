@@ -9,19 +9,24 @@
            :nodes 200000 :string-chars 1048576}}
  :kotoba
  {:source "src/kotoba/lang/canonical_document.kotoba"
-  :authority :canonical-document-codec
-  :surface [:encode-canonical :decode-canonical :roundtrip?]
+  :authority :bounded-document-codec
+  :surface [:encode-canonical :decode-canonical :write-string :read-string
+            :roundtrip? :textual-roundtrip?]
+  :document-profile [:nil :bool :i64 :f64 :string :keyword
+                     :vector :keyword-keyed-map]
+  :rejected [:reader-eval :tagged-literal :discard :set :list :symbol
+             :non-keyword-map-key :duplicate-map-key]
   :required-capabilities []}
  :textual-edn-gap
- {:status :compiler-operation-required
+ {:status :bounded-document-profile-implemented
   :operation [:document-edn-read :document-edn-print]
-  :reason "document-read/document-print currently encode deterministic hex,
-           not textual EDN; claiming compatibility would be dishonest."}
+  :remaining [:set-document-representation :list-document-representation
+              :symbol-document-representation :general-map-key-representation]}
  :verification
  {:self-check-main 42
   :required-targets [:js-browser-kotoba-v1 :wasm32-browser-kotoba-v1]
   :local-result
-  {:date "2026-08-02"
+  {:date "2026-08-03"
    :cljc-jvm {:tests 4 :assertions 31 :result :pass}
    :cljc-nbb {:tests 4 :assertions 31 :result :pass}
    :pure-product-check :pass
