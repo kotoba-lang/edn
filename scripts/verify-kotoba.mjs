@@ -27,9 +27,15 @@ if (webInstance["write-string"](webInstance["read-string"]("#{\"one\" 1 :ready}"
 if (webInstance["write-string"](webInstance["read-string"]("{:b false, :a 1}")) !== "{:a 1 :b false}") {
   throw new Error("textual EDN Web canonicalization mismatch");
 }
+if (webInstance["write-string"](webInstance["read-string"]("{[1 2] :pair, \"name\" 7, :ready true}")) !== "{:ready true \"name\" 7 [1 2] :pair}") {
+  throw new Error("textual EDN Web general map mismatch");
+}
 let webDenied = false;
 try { webInstance["reject-tag"](); } catch (_) { webDenied = true; }
 if (!webDenied) throw new Error("textual EDN Web tag denial mismatch");
+let webDuplicateDenied = false;
+try { webInstance["reject-general-duplicate"](); } catch (_) { webDuplicateDenied = true; }
+if (!webDuplicateDenied) throw new Error("textual EDN Web general duplicate denial mismatch");
 
 const host = await import(pathToFileURL(path.resolve(hostPath)));
 const wasm = await host.instantiateKotoba(fs.readFileSync(path.resolve(wasmPath)));
@@ -46,8 +52,14 @@ if (wasm.instance.exports["write-string"](wasm.instance.exports["read-string"]("
 if (wasm.instance.exports["write-string"](wasm.instance.exports["read-string"]("#{\"one\" 1 :ready}")) !== "#{1 :ready \"one\"}") {
   throw new Error("textual EDN Wasm set roundtrip mismatch");
 }
+if (wasm.instance.exports["write-string"](wasm.instance.exports["read-string"]("{[1 2] :pair, \"name\" 7, :ready true}")) !== "{:ready true \"name\" 7 [1 2] :pair}") {
+  throw new Error("textual EDN Wasm general map mismatch");
+}
 let wasmDenied = false;
 try { wasm.instance.exports["reject-tag"](); } catch (_) { wasmDenied = true; }
 if (!wasmDenied) throw new Error("textual EDN Wasm tag denial mismatch");
+let wasmDuplicateDenied = false;
+try { wasm.instance.exports["reject-general-duplicate"](); } catch (_) { wasmDuplicateDenied = true; }
+if (!wasmDuplicateDenied) throw new Error("textual EDN Wasm general duplicate denial mismatch");
 
 console.log("edn: canonical + textual document Web/Wasm conformance passed");
