@@ -21,6 +21,9 @@ if (webInstance["symbol-roundtrip?"]() !== true) {
 if (webInstance["write-string"](webInstance["read-string"]("(actor/run 7)")) !== "(actor/run 7)") {
   throw new Error("textual EDN Web list roundtrip mismatch");
 }
+if (webInstance["write-string"](webInstance["read-string"]("#{\"one\" 1 :ready}")) !== "#{1 :ready \"one\"}") {
+  throw new Error("textual EDN Web set roundtrip mismatch");
+}
 if (webInstance["write-string"](webInstance["read-string"]("{:b false, :a 1}")) !== "{:a 1 :b false}") {
   throw new Error("textual EDN Web canonicalization mismatch");
 }
@@ -39,6 +42,9 @@ if (!(wasmSymbolRoundtrip === true || wasmSymbolRoundtrip === 1 || wasmSymbolRou
 }
 if (wasm.instance.exports["write-string"](wasm.instance.exports["read-string"]("(actor/run 7)")) !== "(actor/run 7)") {
   throw new Error("textual EDN Wasm list roundtrip mismatch");
+}
+if (wasm.instance.exports["write-string"](wasm.instance.exports["read-string"]("#{\"one\" 1 :ready}")) !== "#{1 :ready \"one\"}") {
+  throw new Error("textual EDN Wasm set roundtrip mismatch");
 }
 let wasmDenied = false;
 try { wasm.instance.exports["reject-tag"](); } catch (_) { wasmDenied = true; }
