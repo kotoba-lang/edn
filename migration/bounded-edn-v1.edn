@@ -13,15 +13,14 @@
   :surface [:encode-canonical :decode-canonical :write-string :read-string
             :roundtrip? :textual-roundtrip?]
   :document-profile [:nil :bool :i64 :f64 :string :keyword :symbol
-                     :vector :keyword-keyed-map]
-  :rejected [:reader-eval :tagged-literal :discard :set :list
+                     :vector :list :keyword-keyed-map]
+  :rejected [:reader-eval :tagged-literal :discard :set
              :non-keyword-map-key :duplicate-map-key]
   :required-capabilities []}
  :textual-edn-gap
  {:status :bounded-document-profile-implemented
   :operation [:document-edn-read :document-edn-print]
-  :remaining [:set-document-representation :list-document-representation
-              :general-map-key-representation]}
+  :remaining [:set-document-representation :general-map-key-representation]}
  :verification
  {:self-check-main 42
   :required-targets [:js-browser-kotoba-v1 :wasm32-browser-kotoba-v1]

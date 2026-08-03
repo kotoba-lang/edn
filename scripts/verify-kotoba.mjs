@@ -18,6 +18,9 @@ const webInstance = web.instantiateKotoba();
 if (webInstance["symbol-roundtrip?"]() !== true) {
   throw new Error("textual EDN Web symbol roundtrip mismatch");
 }
+if (webInstance["write-string"](webInstance["read-string"]("(actor/run 7)")) !== "(actor/run 7)") {
+  throw new Error("textual EDN Web list roundtrip mismatch");
+}
 if (webInstance["write-string"](webInstance["read-string"]("{:b false, :a 1}")) !== "{:a 1 :b false}") {
   throw new Error("textual EDN Web canonicalization mismatch");
 }
@@ -33,6 +36,9 @@ if (wasm.instance.exports.main() !== 42n) {
 const wasmSymbolRoundtrip = wasm.instance.exports["symbol-roundtrip?"]();
 if (!(wasmSymbolRoundtrip === true || wasmSymbolRoundtrip === 1 || wasmSymbolRoundtrip === 1n)) {
   throw new Error("textual EDN Wasm symbol roundtrip mismatch");
+}
+if (wasm.instance.exports["write-string"](wasm.instance.exports["read-string"]("(actor/run 7)")) !== "(actor/run 7)") {
+  throw new Error("textual EDN Wasm list roundtrip mismatch");
 }
 let wasmDenied = false;
 try { wasm.instance.exports["reject-tag"](); } catch (_) { wasmDenied = true; }

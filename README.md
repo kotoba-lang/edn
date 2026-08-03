@@ -14,8 +14,8 @@ Bounded EDN and canonical structured-document codecs for Kotoba applications.
 
 `document-read` / `document-print` remain the canonical hexadecimal storage
 format. `document-edn-read` / `document-edn-print` own textual syntax for nil,
-booleans, i64/f64, strings, keywords, symbols, vectors, and keyword-keyed maps. Sets,
-lists, tags, discard forms, general map keys, and reader eval fail
+booleans, i64/f64, strings, keywords, symbols, vectors, lists, and keyword-keyed maps. Sets,
+tags, discard forms, general map keys, and reader eval fail
 closed; the remaining compatibility boundary is recorded in
 `migration/bounded-edn-v1.edn`.
 
