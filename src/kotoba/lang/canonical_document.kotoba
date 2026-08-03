@@ -1,6 +1,6 @@
 (ns kotoba.lang.canonical-document
   (:export [encode-canonical decode-canonical
-            write-string read-string textual-roundtrip? reject-tag
+            write-string read-string textual-roundtrip? reject-tag symbol-roundtrip?
             roundtrip? main]))
 
 ;; Kotoba-native structured-data storage codec. This is the compiler-owned,
@@ -28,6 +28,14 @@
 (defn reject-tag [] :document
   (read-string "#inst \"2026-08-03\""))
 
+(defn symbol-roundtrip? [] :bool
+  (let [value (document-symbol (symbol "actor/run"))]
+    (if (document-equal? value (read-string (write-string value)))
+      (if (string=? "actor/run" (write-string value))
+        (document-equal? value value)
+        (bool-not (document-equal? value value)))
+      (bool-not (document-equal? value value)))))
+
 (defn main [] :i64
   (let [value (document-map
                :goal (document-string "migrate")
@@ -35,9 +43,11 @@
                :ready (document-bool true))]
     (if (roundtrip? value)
       (if (textual-roundtrip? value)
-        (if (string=? (write-string value)
-                      "{:attempt 3 :goal \"migrate\" :ready true}")
-          42
+        (if (symbol-roundtrip?)
+          (if (string=? (write-string value)
+                        "{:attempt 3 :goal \"migrate\" :ready true}")
+            42
+            1)
           1)
         1)
       1)))

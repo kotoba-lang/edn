@@ -15,6 +15,9 @@ if (web.instantiateKotoba().main() !== 42n) {
   throw new Error("canonical document Web self-check mismatch");
 }
 const webInstance = web.instantiateKotoba();
+if (webInstance["symbol-roundtrip?"]() !== true) {
+  throw new Error("textual EDN Web symbol roundtrip mismatch");
+}
 if (webInstance["write-string"](webInstance["read-string"]("{:b false, :a 1}")) !== "{:a 1 :b false}") {
   throw new Error("textual EDN Web canonicalization mismatch");
 }
@@ -26,6 +29,10 @@ const host = await import(pathToFileURL(path.resolve(hostPath)));
 const wasm = await host.instantiateKotoba(fs.readFileSync(path.resolve(wasmPath)));
 if (wasm.instance.exports.main() !== 42n) {
   throw new Error("canonical document Wasm self-check mismatch");
+}
+const wasmSymbolRoundtrip = wasm.instance.exports["symbol-roundtrip?"]();
+if (!(wasmSymbolRoundtrip === true || wasmSymbolRoundtrip === 1 || wasmSymbolRoundtrip === 1n)) {
+  throw new Error("textual EDN Wasm symbol roundtrip mismatch");
 }
 let wasmDenied = false;
 try { wasm.instance.exports["reject-tag"](); } catch (_) { wasmDenied = true; }
