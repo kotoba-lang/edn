@@ -125,3 +125,30 @@
           "idempotent, which is what lets a generator run twice"))
     (testing "and it leaves what pr-str and pprint already escaped alone"
       (is (= "a\\tb" (edn/escape-controls "a\\tb"))))))
+
+(deftest structural-whitespace-survives
+  (testing "This function takes TEXT, not a value. `pr-str` escapes tab,
+            newline and return inside string literals — but the whitespace
+            BETWEEN forms in a pretty-printed artefact is raw code 9/10/13
+            that no writer touched, and escaping it destroys the document.
+
+            Measured 2026-08-19 by breaking it: removing the exemption turned
+            a 16,250-character KIR artefact into one line with zero line
+            terminators, and it stopped parsing — `Map literal must contain
+            an even number of forms`. The mutation that should have caught it
+            survived because the only caller under test was `write-string`,
+            whose `pr-str` output is one line. A live guard was deleted and
+            called dead code."
+    (let [pretty "{:a 1,\n :b {:c 2,\n     :d 3}}\n"
+          out (edn/escape-controls pretty)]
+      (is (= pretty out) "multi-line text passes through untouched")
+      (is (= 3 (count (filter #(= \newline %) out))))
+      (is (= {:a 1 :b {:c 2 :d 3}} (edn/read-string out))
+          "and it still parses, which is the property that broke"))
+    (testing "a tab used as layout is layout, not a control byte to hide"
+      (is (= "a\tb" (edn/escape-controls "a\tb"))))
+    (testing "but a control character that is NOT layout is still escaped,
+              even when it arrives beside layout"
+      (let [out (edn/escape-controls (str "{:a 1,\n :b \"x" (char 0) "y\"}"))]
+        (is (str/includes? out "\\u0000"))
+        (is (= 1 (count (filter #(= \newline %) out))))))))

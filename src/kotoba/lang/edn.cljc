@@ -130,6 +130,15 @@
         (throw error)
         (throw (ex-info "EDN input was rejected" {:phase :decode} error))))))
 
+(def ^:private literal-controls
+  "The C0 controls text keeps literal: tab, newline, carriage return.
+
+  Not because `pr-str` escapes them inside strings — it does — but because
+  this function takes TEXT, and the whitespace between forms in a
+  pretty-printed artefact is raw code 9/10/13 that no writer touched.
+  Escaping it destroys the document."
+  #{9 10 13})
+
 (defn escape-controls
   "Replace every control character in `text` with its `\\uXXXX` escape,
   except tab, newline and carriage return.
@@ -189,15 +198,34 @@
               code #?(:clj (int c) :cljs (.charCodeAt text i))]
           (recur (inc i)
                  (conj! acc
-                        ;; No `literal-controls` exception, and that is
-                        ;; measured rather than assumed: `pr-str` already
-                        ;; escapes tab, newline and carriage return —
-                        ;; `(pr-str "a\tb")` is `"a\\tb"` — and leaves
-                        ;; 0, 7, 27 and 127 raw. So the readable three never
-                        ;; reach this loop, and a set exempting them was a
-                        ;; branch nothing could take. A mutation emptying it
-                        ;; reddened nothing, which is how it was found.
-                        (if (or (< code 32) (= code 127))
+                        ;; Tab, newline and carriage return are LEFT ALONE,
+                        ;; and the reasoning that once removed this exemption
+                        ;; is worth keeping because it was wrong in an
+                        ;; instructive way.
+                        ;;
+                        ;; It ran: `pr-str` already escapes 9, 10 and 13, so
+                        ;; the readable three never reach this loop, so the
+                        ;; exemption is a branch nothing can take — and a
+                        ;; mutation emptying it reddened nothing, which
+                        ;; seemed to confirm it.
+                        ;;
+                        ;; That is true of characters INSIDE a string
+                        ;; literal and false of the whitespace BETWEEN forms.
+                        ;; This function takes text, not a value, so a
+                        ;; pretty-printed artefact arrives with structural
+                        ;; newlines that no writer escaped. Removing the
+                        ;; exemption turned a 16,250-character KIR file into
+                        ;; one line with zero line terminators, and it stopped
+                        ;; parsing: `Map literal must contain an even number
+                        ;; of forms`. Measured 2026-08-19, on the artefact
+                        ;; this escaping exists to fix.
+                        ;;
+                        ;; The mutation had survived because the only caller
+                        ;; under test was `write-string`, whose `pr-str`
+                        ;; output is one line. A live guard was deleted and
+                        ;; called dead code.
+                        (if (and (or (< code 32) (= code 127))
+                                 (not (literal-controls code)))
                           (str "\\u"
                                (let [h #?(:clj (Integer/toHexString code)
                                           :cljs (.toString code 16))]
