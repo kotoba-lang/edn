@@ -1,0 +1,51 @@
+;; One mutation per invariant. `:find` must occur EXACTLY ONCE in `:file` —
+;; `tools/mutate.cljs` refuses otherwise, because a mutation landing in a
+;; comment or a second call site produces a red suite that proves nothing.
+;;
+;; ## SCOPE
+;;
+;; Covers `escape-controls` and the ordering of `write-string`'s byte limit.
+;; It does NOT cover the reader's bounds (depth, node count, token length) or
+;; `validate-shape!` — those have assertions and no mutations here, so a clean
+;; run means "the escaping invariants are measured" and NOT "this library is
+;; measured".
+[{:id :every-control-is-escaped
+  :invariant "total: no input produces a raw control byte in the output"
+  :file "src/kotoba/lang/edn.cljc"
+  :find "(if (or (< code 32) (= code 127))"
+  :replace "(if (or (< code 8) (= code 127))"}
+
+ {:id :del-is-a-control-too
+  :invariant "U+007F makes file(1) say `data` exactly as U+0000 does"
+  :file "src/kotoba/lang/edn.cljc"
+  :find "(< code 32) (= code 127))"
+  :replace "(< code 32) (= code 128))"}
+
+ ;; A mutation was written and REMOVED, with its reason, because deleting
+ ;; one to clean a table is what this harness exists to prevent:
+ ;;
+ ;;   :tab-newline-and-return-stay-literal — emptying a `literal-controls`
+ ;;   exemption set reddened nothing, and the set turned out to be a branch
+ ;;   nothing could take: `pr-str` already escapes 9, 10 and 13 and leaves
+ ;;   0, 7, 27 and 127 raw, so the readable three never reach the loop. The
+ ;;   set was deleted rather than the mutation. `tab-newline-and-return-stay-
+ ;;   literal` in the suite still holds — it just measures `pr-str`, which is
+ ;;   worth keeping and worth saying.
+
+ {:id :the-escape-is-four-hex-digits
+  :invariant "\\u0 is not an EDN escape; the reader would not take it back"
+  :file "src/kotoba/lang/edn.cljc"
+  :find "(str (subs \"0000\" 0 (- 4 (count h))) h)"
+  :replace "h"}
+
+ {:id :the-byte-limit-is-applied-after-escaping
+  :invariant "one control becomes six; the limit is on what is written"
+  :file "src/kotoba/lang/edn.cljc"
+  :find "  (let [text (escape-controls (pr-str (validate-shape! value)))]"
+  :replace "  (let [text (pr-str (validate-shape! value))]"}
+
+ {:id :escaping-does-not-rewrite-innocent-text
+  :invariant "a value with no controls comes out exactly as pr-str wrote it"
+  :file "src/kotoba/lang/edn.cljc"
+  :find "                          (str \"\\\\u\""
+  :replace "                          (str \"X\\\\u\""}]
