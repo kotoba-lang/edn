@@ -109,3 +109,19 @@
       (is (= (pr-str v) (edn/write-string v))
           (str "escaping altered a value with no control characters: "
                (pr-str v))))))
+
+(deftest escape-controls-is-usable-by-other-writers
+  (testing "`write-string` is one writer with one shape and a byte bound.
+            A checked-in KIR file is written by `clojure.pprint/pprint`,
+            where the multi-line layout IS the point — and pprint emits the
+            raw byte exactly as pr-str does. Those writers need the rule and
+            not this writer, so the rule is handed over rather than
+            reimplemented"
+    (is (= "a\\u0000b" (edn/escape-controls (str "a" (char 0) "b"))))
+    (testing "it is a text function, not a value function — it takes and
+              returns text, so any writer can post-process with it"
+      (is (= "already \\u0000 escaped"
+             (edn/escape-controls "already \\u0000 escaped"))
+          "idempotent, which is what lets a generator run twice"))
+    (testing "and it leaves what pr-str and pprint already escaped alone"
+      (is (= "a\\tb" (edn/escape-controls "a\\tb"))))))

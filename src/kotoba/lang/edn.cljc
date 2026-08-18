@@ -130,7 +130,7 @@
         (throw error)
         (throw (ex-info "EDN input was rejected" {:phase :decode} error))))))
 
-(defn- escape-controls
+(defn escape-controls
   "Replace every control character in `text` with its `\\uXXXX` escape,
   except tab, newline and carriage return.
 
@@ -166,7 +166,20 @@
   `kotoba-lang/rdf-canon` and `kotoba-lang/occupation` did.
 
   Total and idempotent: no input produces a raw control byte in the output,
-  and escaping already-escaped text is a no-op."
+  and escaping already-escaped text is a no-op.
+
+  ## Why this is public and not folded into `write-string` alone
+
+  `write-string` is one writer with a one-line shape and a byte bound.
+  Generated artefacts are written by other writers with other shapes —
+  `clojure.pprint/pprint` for a checked-in KIR file, where the multi-line
+  layout IS the point and a single line would be useless. Measured
+  2026-08-19: `pprint` emits the raw byte exactly as `pr-str` does
+  (`[123 58 115 32 34 97 0 98 34 125 10]`).
+
+  Those writers need the escaping rule and not this writer. Handing them the
+  function is one definition; leaving them to reimplement it is two that can
+  disagree, which is the defect this library exists to remove."
   [text]
   (let [n (count text)]
     (loop [i 0 acc (transient [])]
