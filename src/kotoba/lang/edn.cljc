@@ -130,8 +130,75 @@
         (throw error)
         (throw (ex-info "EDN input was rejected" {:phase :decode} error))))))
 
-(defn write-string [value]
-  (let [text (pr-str (validate-shape! value))]
+(defn- escape-controls
+  "Replace every control character in `text` with its `\\uXXXX` escape,
+  except tab, newline and carriage return.
+
+  ## Why the writer and not a checker
+
+  A single raw control byte makes `file(1)` classify a file as `data`, and
+  grep then **skips it silently**: `grep -c somename <file>` prints nothing
+  and exits 1 — exactly what a file not containing that name does. Every
+  search-based conclusion about that file is void and nothing says so.
+
+  Measured 2026-08-18 across this workspace: **20 source and resource files**
+  held raw NUL bytes, and every one of them was there on purpose — a sentinel
+  in a two-pass replace, the start of a regex character range, SQLite magic
+  bytes, a domain separator in a hash input. Three of the twenty were
+  `.kir.edn`, this workspace's canonical IR, and the code they encode is
+  *the null-byte check itself*.
+
+  They were there on purpose because **`pr-str` emits the raw byte**:
+  `(pr-str (str \"a\" (char 0) \"b\"))` is the five bytes `34 97 0 98 34`. It
+  round-trips, so it is semantically canonical and textually binary.
+
+  A gate that finds these afterwards leaves a window. A writer that cannot
+  emit one closes it. So this lives here, and the gate becomes a backstop for
+  text that arrived from somewhere else — which is what backstops are for.
+
+  ## Why this cannot move a CID
+
+  Identity is over the **value**, and `\\u0000` reads back as the same
+  character, so `read-string` returns an equal value either way. Escaping is a
+  property of the text projection, not of the thing projected. Where something
+  hashes text bytes rather than a value, that is a different decision and this
+  function is not it — pin the digest and prove it, the way
+  `kotoba-lang/rdf-canon` and `kotoba-lang/occupation` did.
+
+  Total and idempotent: no input produces a raw control byte in the output,
+  and escaping already-escaped text is a no-op."
+  [text]
+  (let [n (count text)]
+    (loop [i 0 acc (transient [])]
+      (if (= i n)
+        (apply str (persistent! acc))
+        (let [c (nth text i)
+              code #?(:clj (int c) :cljs (.charCodeAt text i))]
+          (recur (inc i)
+                 (conj! acc
+                        ;; No `literal-controls` exception, and that is
+                        ;; measured rather than assumed: `pr-str` already
+                        ;; escapes tab, newline and carriage return —
+                        ;; `(pr-str "a\tb")` is `"a\\tb"` — and leaves
+                        ;; 0, 7, 27 and 127 raw. So the readable three never
+                        ;; reach this loop, and a set exempting them was a
+                        ;; branch nothing could take. A mutation emptying it
+                        ;; reddened nothing, which is how it was found.
+                        (if (or (< code 32) (= code 127))
+                          (str "\\u"
+                               (let [h #?(:clj (Integer/toHexString code)
+                                          :cljs (.toString code 16))]
+                                 (str (subs "0000" 0 (- 4 (count h))) h)))
+                          c))))))))
+
+(defn write-string
+  "Canonical EDN text for `value`.
+
+  The byte limit is checked **after** escaping, not before: one control
+  character becomes six characters, so a value that passed a pre-escape check
+  could still produce oversized output. The limit is on what is written."
+  [value]
+  (let [text (escape-controls (pr-str (validate-shape! value)))]
     (when (> (utf8-size text) max-edn-bytes)
       (reject! "EDN output exceeds byte limit" {:limit max-edn-bytes}))
     text))
