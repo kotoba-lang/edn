@@ -12,8 +12,8 @@
 [{:id :every-control-is-escaped
   :invariant "total: no input produces a raw control byte in the output"
   :file "src/kotoba/lang/edn.cljc"
-  :find "(if (or (< code 32) (= code 127))"
-  :replace "(if (or (< code 8) (= code 127))"}
+  :find "(if (and (or (< code 32) (= code 127))"
+  :replace "(if (and (or (< code 8) (= code 127))"}
 
  {:id :del-is-a-control-too
   :invariant "U+007F makes file(1) say `data` exactly as U+0000 does"
@@ -21,16 +21,22 @@
   :find "(< code 32) (= code 127))"
   :replace "(< code 32) (= code 128))"}
 
- ;; A mutation was written and REMOVED, with its reason, because deleting
- ;; one to clean a table is what this harness exists to prevent:
+ ;; ⚠ The note that stood here said this mutation was removed because the
+ ;; `literal-controls` set was "a branch nothing could take". **That was
+ ;; wrong, and the mutation was right.** The reasoning held for characters
+ ;; inside a string literal and failed for the whitespace between forms:
+ ;; this function takes TEXT, so a pretty-printed artefact arrives with raw
+ ;; structural newlines that no writer escaped. Deleting the set turned a
+ ;; 16,250-character KIR file into one line and it stopped parsing.
  ;;
- ;;   :tab-newline-and-return-stay-literal — emptying a `literal-controls`
- ;;   exemption set reddened nothing, and the set turned out to be a branch
- ;;   nothing could take: `pr-str` already escapes 9, 10 and 13 and leaves
- ;;   0, 7, 27 and 127 raw, so the readable three never reach the loop. The
- ;;   set was deleted rather than the mutation. `tab-newline-and-return-stay-
- ;;   literal` in the suite still holds — it just measures `pr-str`, which is
- ;;   worth keeping and worth saying.
+ ;; The mutation had survived because the only caller under test was
+ ;; `write-string`, whose `pr-str` output is one line. The gap was in the
+ ;; TESTS, not in the guard. Both are back.
+ {:id :layout-whitespace-is-not-escaped
+  :invariant "structural newlines survive; escaping them destroys the document"
+  :file "src/kotoba/lang/edn.cljc"
+  :find "#{9 10 13})"
+  :replace "  #{})"}
 
  {:id :the-escape-is-four-hex-digits
   :invariant "\\u0 is not an EDN escape; the reader would not take it back"
