@@ -4,9 +4,7 @@
   Reader evaluation and tagged literals are forbidden. Input size, nesting,
   token length, node count, and string length are all bounded before values
   cross an actor or I/O boundary."
-  (:refer-clojure :exclude [read-string])
-  (:require #?(:clj [clojure.edn :as host-edn]
-               :cljs [cljs.reader :as host-edn])))
+  (:refer-clojure :exclude [read-string]))
 
 (def max-edn-bytes (* 8 1024 1024))
 (def max-depth 128)
@@ -117,6 +115,249 @@
       (walk value 0)
       value)))
 
+
+;; ---------------------------------------------------------------------------
+;; The reader. This namespace does not use clojure.edn or cljs.reader.
+;; ---------------------------------------------------------------------------
+;;
+;; `preflight!` above has already proven the text is structurally sound and
+;; within every bound, so this parser can assume balanced delimiters and no
+;; dispatch other than `#{`. It exists because the two host readers this used
+;; to delegate to DO NOT AGREE, and delegating inherited the disagreement:
+;;
+;;   1N     BigInt on the JVM, a lossy double on ClojureScript
+;;   1.5M   BigDecimal on the JVM, a lossy double on ClojureScript
+;;   1/2    a Ratio on the JVM, a read error on ClojureScript
+;;   9e18   a Long the JVM keeps exactly and JavaScript silently rounds
+;;
+;; Each of those is a value that means one thing here and a different thing
+;; there, from the same bytes. This reader REFUSES all four, with a typed
+;; ex-info, rather than picking a host to be right. That is the same fail-
+;; closed stance the namespace already takes on tagged literals: a config
+;; reader has no business quietly changing a number's precision, and a
+;; refusal is a thing a caller can see.
+;;
+;; Integers are accepted up to the exact-integer range JavaScript can
+;; represent (2^53-1). Beyond it the JVM would be right and the browser would
+;; be wrong, which is the whole class above.
+
+(def max-exact-integer
+  "Largest integer both hosts represent exactly (2^53 - 1). An integer literal
+  outside +/- this is refused rather than silently rounded on one host."
+  9007199254740991)
+
+(defn- alphanumeric? [ch]
+  (let [c #?(:clj (int ch) :cljs (.charCodeAt (str ch) 0))]
+    (or (<= 48 c 57) (<= 65 c 90) (<= 97 c 122))))
+
+(defn- hex->int [hex]
+  #?(:clj (Integer/parseInt ^String hex 16) :cljs (js/parseInt hex 16)))
+
+(defn- skip-blanks
+  "Index of the next character that begins a value, skipping separators and
+  `;` comments."
+  [text i]
+  (let [n (count text)]
+    (loop [i i]
+      (cond
+        (>= i n) i
+        (separator? (.charAt ^String text i)) (recur (inc i))
+        (= (.charAt ^String text i) \;)
+        (recur (loop [j i]
+                 (if (or (>= j n) (= (.charAt ^String text j) \newline)) j (recur (inc j)))))
+        :else i))))
+
+(defn- read-string-literal
+  "`[value next-index]` for the string starting at the opening quote `i`."
+  [text i]
+  (let [n (count text)]
+    (loop [j (inc i) out []]
+      (when (>= j n) (reject! "EDN string is unterminated" {}))
+      (let [c (.charAt ^String text j)]
+        (cond
+          (= c \") [(apply str out) (inc j)]
+
+          (= c \\)
+          (let [e (when (< (inc j) n) (.charAt ^String text (inc j)))]
+            (cond
+              (= e \") (recur (+ j 2) (conj out \"))
+              (= e \\) (recur (+ j 2) (conj out \\))
+              (= e \/) (recur (+ j 2) (conj out \/))
+              (= e \b) (recur (+ j 2) (conj out (char 8)))
+              (= e \f) (recur (+ j 2) (conj out (char 12)))
+              (= e \n) (recur (+ j 2) (conj out \newline))
+              (= e \r) (recur (+ j 2) (conj out \return))
+              (= e \t) (recur (+ j 2) (conj out \tab))
+              (= e \u)
+              (let [hex (when (<= (+ j 6) n) (subs text (+ j 2) (+ j 6)))]
+                (if (and hex (re-matches #"[0-9a-fA-F]{4}" hex))
+                  (recur (+ j 6) (conj out (char (hex->int hex))))
+                  (reject! "EDN unicode escape is malformed" {})))
+              :else (reject! "EDN string escape is not recognised"
+                             {:escape (str e)})))
+
+          :else (recur (inc j) (conj out c)))))))
+
+(def ^:private named-chars
+  {"newline" \newline "space" \space "tab" \tab "return" \return
+   "backspace" (char 8) "formfeed" (char 12)})
+
+(defn- read-char-literal
+  "`[value next-index]` for the character literal starting at the backslash `i`.
+  The character immediately after the backslash is always literal (so a closing
+  paren and a semicolon both read as characters), then a name continues while
+  alphanumeric."
+  [text i]
+  (let [n (count text)]
+    (when (>= (inc i) n) (reject! "EDN character literal is empty" {}))
+    (let [j   (loop [j (+ i 2)]
+                (if (and (< j n) (alphanumeric? (.charAt ^String text j)))
+                  (recur (inc j)) j))
+          tok (subs text (inc i) j)]
+      (cond
+        (= 1 (count tok)) [(.charAt ^String tok 0) j]
+        (contains? named-chars tok) [(get named-chars tok) j]
+        (re-matches #"u[0-9a-fA-F]{4}" tok) [(char (hex->int (subs tok 1))) j]
+        :else (reject! "EDN character literal is not recognised" {:literal tok})))))
+
+(defn- token-end
+  "Index one past the bare token starting at `i`."
+  [text i]
+  (let [n (count text)]
+    (loop [j i]
+      (if (or (>= j n)
+              (separator? (.charAt ^String text j))
+              (opening? (.charAt ^String text j))
+              (closing? (.charAt ^String text j))
+              (= (.charAt ^String text j) \")
+              (= (.charAt ^String text j) \;))
+        j
+        (recur (inc j))))))
+
+(defn- refuse-imprecise! [tok kind]
+  (reject! (str "EDN number would not mean the same on every host: " tok)
+           {:kotoba.lang.edn/reason kind :token tok}))
+
+(defn- parse-number [tok]
+  (cond
+    ;; the four host-divergent forms, refused rather than rounded
+    (re-matches #"[+-]?[0-9]+N" tok)                       (refuse-imprecise! tok :number/bigint-suffix)
+    (re-matches #"[+-]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?M" tok) (refuse-imprecise! tok :number/bigdec-suffix)
+    (re-matches #"[+-]?[0-9]+/[0-9]+" tok)                 (refuse-imprecise! tok :number/ratio)
+
+    (re-matches #"[+-]?[0-9]+" tok)
+    (let [magnitude (if (or (= \+ (.charAt ^String tok 0)) (= \- (.charAt ^String tok 0)))
+                      (subs tok 1) tok)]
+      ;; length first: a 400-digit literal must not be converted before it is
+      ;; range-checked, or the conversion itself is the thing that loses it
+      (when (> (count magnitude) 16) (refuse-imprecise! tok :number/integer-range))
+      (let [v #?(:clj (Long/parseLong ^String tok) :cljs (js/parseInt tok 10))]
+        (when (> (abs v) max-exact-integer) (refuse-imprecise! tok :number/integer-range))
+        v))
+
+    (re-matches #"[+-]?([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)([eE][+-]?[0-9]+)?" tok)
+    #?(:clj (Double/parseDouble ^String tok) :cljs (js/parseFloat tok))
+
+    :else (reject! "EDN number is malformed" {:token tok})))
+
+(defn- parse-atom [tok]
+  (cond
+    (= tok "nil")   nil
+    (= tok "true")  true
+    (= tok "false") false
+
+    (= (.charAt ^String tok 0) \:)
+    (cond
+      (= tok ":")                  (reject! "EDN keyword is empty" {})
+      (= (subs tok 0 (min 2 (count tok))) "::")
+      (reject! "EDN auto-resolved keywords are forbidden" {:token tok})
+      :else (keyword (subs tok 1)))
+
+    (re-matches #"[+-]?[.0-9].*" tok) (parse-number tok)
+
+    :else (symbol tok)))
+
+(declare read-form)
+
+(defn- read-sequence
+  "Read forms until `close`, returning `[items next-index]`."
+  [text i close]
+  (let [n (count text)]
+    (loop [i i items []]
+      (let [i (skip-blanks text i)]
+        (when (>= i n) (reject! "EDN collection is unterminated" {}))
+        (if (= (.charAt ^String text i) close)
+          [items (inc i)]
+          (let [[v i'] (read-form text i)]
+            (recur i' (conj items v))))))))
+
+(defn- pairs->map
+  "Build the map, small ones as an array-map so SOURCE ORDER SURVIVES.
+
+  Not cosmetic. Both host readers do this -- `clojure.edn` hands the pairs to
+  `RT/map`, which returns a PersistentArrayMap at eight entries or fewer -- and
+  `write-string` prints a map in iteration order, so a hash-map here makes
+  read->write reorder the keys of every small map. That breaks textual
+  idempotence, which is exactly the property a `--check` gate over generated
+  text depends on: the file would differ from itself on every regeneration.
+
+  Above eight entries both hosts promote to a hash-map and order is not
+  preserved by anyone, so this matches that too rather than inventing a
+  stronger guarantee than the thing it replaced."
+  [items]
+  (when (odd? (count items))
+    (reject! "EDN map has an odd number of forms" {:count (count items)}))
+  (let [ks (take-nth 2 items)]
+    (when (not= (count ks) (count (set ks)))
+      (reject! "EDN map has a duplicate key" {}))
+    (if (<= (count ks) 8)
+      (apply array-map items)
+      (apply hash-map items))))
+
+(defn- items->set [items]
+  (when (not= (count items) (count (set items)))
+    (reject! "EDN set has a duplicate element" {}))
+  (set items))
+
+(defn- read-form
+  "`[value next-index]` for the one form starting at `i` (already past blanks)."
+  [text i]
+  (let [n (count text)]
+    (when (>= i n) (reject! "EDN input is empty" {}))
+    (let [c (.charAt ^String text i)]
+      (cond
+        (= c \") (read-string-literal text i)
+        (= c \\) (read-char-literal text i)
+
+        (= c \#)
+        (if (and (< (inc i) n) (= (.charAt ^String text (inc i)) \{))
+          (let [[items i'] (read-sequence text (+ i 2) \})]
+            [(items->set items) i'])
+          (reject! "EDN dispatch forms are forbidden" {}))
+
+        (= c \() (let [[items i'] (read-sequence text (inc i) \))] [(apply list items) i'])
+        (= c \[) (let [[items i'] (read-sequence text (inc i) \])] [items i'])
+        (= c \{) (let [[items i'] (read-sequence text (inc i) \})] [(pairs->map items) i'])
+
+        (closing? c) (reject! "EDN collection delimiters do not match" {})
+
+        :else (let [j (token-end text i)]
+                (when (= j i) (reject! "EDN token is empty" {}))
+                [(parse-atom (subs text i j)) j])))))
+
+(defn- read-one
+  "The single top-level form in `text`. `preflight!` has already refused empty
+  input and trailing forms, so anything left over here is this parser
+  disagreeing with that lexer -- which is a defect, not bad input, and says so."
+  [text]
+  (let [i        (skip-blanks text 0)
+        [v i']   (read-form text i)
+        leftover (skip-blanks text i')]
+    (when (< leftover (count text))
+      (reject! "EDN reader and preflight disagree about where the form ends"
+               {:kotoba.lang.edn/reason :reader/desync :index leftover}))
+    v))
+
 (defn read-string [text]
   (when-not (string? text)
     (reject! "EDN input must be text" {}))
@@ -124,7 +365,7 @@
     (reject! "EDN input exceeds byte limit" {:limit max-edn-bytes}))
   (preflight! text)
   (try
-    (validate-shape! (host-edn/read-string text))
+    (validate-shape! (read-one text))
     (catch #?(:clj Exception :cljs :default) error
       (if (= :decode (:phase (ex-data error)))
         (throw error)
