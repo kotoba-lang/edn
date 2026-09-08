@@ -155,3 +155,105 @@
   (doseq [input ["#inst \"2026-01-01\"" "#uuid \"x\"" "#_ :discarded"
                  "#foo{:a 1}" "#:{:a 1}" "#:_{:a 1}" "#:a[1]"]]
     (is (not= ::no-throw (refusal input)) (pr-str input))))
+
+;; ---------------------------------------------------------------------------
+;; options
+;; ---------------------------------------------------------------------------
+
+(deftest the-strict-default-is-unchanged-by-options-existing
+  ;; The whole risk of adding options is that the no-option path quietly
+  ;; loosens. Every one of these is the behaviour from before options existed.
+  (is (= :decode (:phase (ex-data (try (edn/read-string "#inst \"2026\"") nil
+                                       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e))))))
+  (is (not= ::no-throw (refusal "#inst \"2026\"")))
+  (is (not= ::no-throw (refusal "#_ :discarded")))
+  (is (not= ::no-throw (refusal "")))
+  (is (not= ::no-throw (refusal "   ")))
+  ;; and the empty options map is the strict default, not a relaxation
+  (is (not= ::no-throw (try (edn/read-string {} "#inst \"2026\"") ::no-throw
+                            (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))))
+
+(deftest readers-and-default-dispatch-like-clojure-edn
+  (is (= {:inst "2026"}
+         (edn/read-string {:readers {'inst (fn [v] {:inst v})}} "#inst \"2026\"")))
+  (is (= '[inst "2026"]
+         (edn/read-string {:default (fn [t v] [t v])} "#inst \"2026\"")))
+  ;; :readers wins over :default for a tag it has
+  (is (= :from-readers
+         (edn/read-string {:readers {'a (constantly :from-readers)}
+                           :default (constantly :from-default)}
+                          "#a 1")))
+  ;; :default catches the ones :readers does not
+  (is (= :from-default
+         (edn/read-string {:readers {'a (constantly :from-readers)}
+                           :default (constantly :from-default)}
+                          "#b 1")))
+  ;; a tag with NO handler is still refused even though other tags have one
+  (is (not= ::no-throw
+            (try (edn/read-string {:readers {'a identity}} "#b 1") ::no-throw
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+  ;; the passthrough shape kotoba-lang/fmt needs
+  (is (= {:a "2026"} (edn/read-string {:default (fn [_t v] v)} "{:a #inst \"2026\"}")))
+  ;; nested, and inside every collection kind
+  (let [opts {:default (fn [t v] [t v])}]
+    (is (= '{:a [tag [1 2]] :b 3} (edn/read-string opts "{:a #tag [1 2] :b 3}")))
+    (is (= '[[tag 1]] (edn/read-string opts "[#tag 1]")))
+    (is (= '#{[tag 1]} (edn/read-string opts "#{#tag 1}")))
+    (is (= '[tag [tag 1]] (edn/read-string opts "#tag #tag 1")))))
+
+(deftest a-tagged-value-is-still-bounded-and-still-one-form
+  (let [opts {:default (fn [_t v] v)}]
+    ;; `#inst "x" #inst "y"` is TWO top-level forms and is still refused as
+    ;; trailing -- the lexer counts the value, not the tag
+    (is (not= ::no-throw
+              (try (edn/read-string opts "#a 1 #b 2") ::no-throw
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+    ;; a tag with nothing after it is refused
+    (is (not= ::no-throw
+              (try (edn/read-string opts "#a") ::no-throw
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+    ;; the depth bound still applies through a tag
+    (with-redefs [edn/max-depth 4]
+      (is (not= ::no-throw
+                (try (edn/read-string opts "#a [[[[[0]]]]]") ::no-throw
+                     (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))))))
+
+(deftest eof-answers-the-same-on-every-host
+  ;; Measured 2026-09-08: `(clojure.edn/read-string {:eof s} "")` answers the
+  ;; sentinel on the JVM and nil on ClojureScript, while whitespace-only and
+  ;; comment-only input answer the sentinel on BOTH. So the divergence is the
+  ;; empty string alone -- narrower than the one call site in this workspace
+  ;; had recorded ("cljs ignores :eof"). Here all three answer the sentinel.
+  (let [s #?(:clj (Object.) :cljs (js/Object.))]
+    (doseq [t ["" "   " ";; c\n" "\n\t"]]
+      (is (identical? s (edn/read-string {:eof s} t)) (pr-str t))))
+  ;; :eof does not swallow a real value, and does not swallow a real error
+  (is (= 1 (edn/read-string {:eof ::none} "1")))
+  (is (not= ::no-throw
+            (try (edn/read-string {:eof ::none} "[1") ::no-throw
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+  ;; without :eof, empty input still throws -- the option adds a case, it does
+  ;; not change the default
+  (is (not= ::no-throw (refusal ""))))
+
+(deftest an-unrecognised-option-is-refused-not-ignored
+  ;; A typo in an option map is otherwise silently the strict default: the
+  ;; caller thinks tags are handled and they are not.
+  (doseq [bad [{:reader {}} {:defaults (fn [_ v] v)} {:eof-value nil}]]
+    (is (not= ::no-throw
+              (try (edn/read-string bad "1") ::no-throw
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))
+        (pr-str bad)))
+  (is (not= ::no-throw (try (edn/read-string :not-a-map "1") ::no-throw
+                            (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+  (is (not= ::no-throw (try (edn/read-string {:default :not-a-fn} "1") ::no-throw
+                            (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))))
+
+(deftest read-all-takes-the-same-options-and-refuses-eof
+  (is (= '[[a 1] [b 2]]
+         (edn/read-all {:default (fn [t v] [t v])} "#a 1 #b 2")))
+  (is (= [] (edn/read-all "")))
+  ;; :eof would be meaningless here: the empty vector already IS the answer
+  (is (not= ::no-throw
+            (try (edn/read-all {:eof ::x} "1") ::no-throw
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))))
