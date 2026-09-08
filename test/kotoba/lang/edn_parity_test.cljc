@@ -27,6 +27,10 @@
    "\"あいう\"" "\"𝄞\""
    ":a" ":a/b" ":a.b/c" ":*" ":+" ":-" ":a1"
    "sym" "a/b" "a.b/c" "+" "-" "*" "->" "some-name" "a1"
+   ;; a leading dot makes a SYMBOL, not a number -- measured against the
+   ;; oracle, and the reason two of the workspace's own resource files were
+   ;; being refused
+   "." ".5" "-.5" "..." ".x" "a." "-"
    "\\a" "\\A" "\\0" "\\newline" "\\space" "\\tab" "\\return"
    "\\backspace" "\\formfeed" "\\u3042" "\\;" "\\\\"
 
@@ -37,6 +41,9 @@
    "{:a 1}" "{:a 1 :b 2}" "{\"k\" \"v\"}" "{1 2, 3 4}"
    "#{1 2 3}" "#{:a}" "#{[1] [2]}"
    "{:a [1 {:b #{:c}}]}"
+   ;; namespaced maps: admitted because they name no reader
+   "#:a{:b 1}" "#:a{:b 1 :c/d 2}" "#:a{:b 1, :c 2}" "{:x #:a{:b 1}}"
+   "#:a{}" "#:a.b{:c 1}" "[#:a{:b 1} #:c{:d 2}]" "#:a{sym 1}"
    "[{:a 1} {:b 2}]"
 
    ;; whitespace, commas and comments in every position
@@ -137,3 +144,14 @@
   (is (= \a (edn/read-string "\\a")))
   (is (= \newline (edn/read-string "\\newline")))
   (is (= \; (edn/read-string "\\;"))))
+
+(deftest namespaced-maps-are-the-only-other-admitted-dispatch
+  ;; `#{` and `#:ns{` are data shapes -- neither names a reader, so neither can
+  ;; run anything. Everything else beginning with `#` is still refused, which
+  ;; is what keeps tagged literals out.
+  (is (= {:a/b 1} (edn/read-string "#:a{:b 1}")))
+  (is (= {:a/b 1 :c/d 2} (edn/read-string "#:a{:b 1 :c/d 2}")))
+  (is (= '{a/b 1} (edn/read-string "#:a{b 1}")))
+  (doseq [input ["#inst \"2026-01-01\"" "#uuid \"x\"" "#_ :discarded"
+                 "#foo{:a 1}" "#:{:a 1}" "#:_{:a 1}" "#:a[1]"]]
+    (is (not= ::no-throw (refusal input)) (pr-str input))))

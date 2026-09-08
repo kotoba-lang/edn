@@ -66,14 +66,30 @@
                  (if (zero? depth) (inc forms) forms))
 
           (= ch \#)
-          (if (and (< (inc index) (count text))
-                   (= (.charAt text (inc index)) \{))
-            (let [next-stack (conj stack \})]
-              (when (> (count next-stack) max-depth)
-                (reject! "EDN nesting exceeds limit" {:limit max-depth}))
-              (recur (+ index 2) next-stack 0 false false false false
-                     (if (zero? depth) (inc forms) forms)))
-            (reject! "EDN dispatch forms are forbidden" {}))
+          ;; Two dispatch forms are admitted and no others: `#{` (a set) and
+          ;; `#:ns{` (a namespaced map). Both are pure data shapes -- neither
+          ;; names a reader, so neither can run anything. Every other `#` is
+          ;; still refused, tagged literals included.
+          (let [nxt (when (< (inc index) (count text)) (.charAt text (inc index)))
+                ;; for `#:ns{`, walk the namespace token to the brace
+                ns-end (when (= nxt \:)
+                         (loop [j (+ index 2)]
+                           (cond
+                             (>= j (count text)) nil
+                             (= (.charAt text j) \{) j
+                             (or (separator? (.charAt text j))
+                                 (opening? (.charAt text j))
+                                 (closing? (.charAt text j))) nil
+                             :else (recur (inc j)))))
+                brace-at (cond (= nxt \{) (inc index)
+                               ns-end     ns-end)]
+            (if brace-at
+              (let [next-stack (conj stack \})]
+                (when (> (count next-stack) max-depth)
+                  (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+                (recur (inc brace-at) next-stack 0 false false false false
+                       (if (zero? depth) (inc forms) forms)))
+              (reject! "EDN dispatch forms are forbidden" {})))
 
           (opening? ch)
           (let [next-stack (conj stack (matching-close ch))]
@@ -255,7 +271,8 @@
         (when (> (abs v) max-exact-integer) (refuse-imprecise! tok :number/integer-range))
         v))
 
-    (re-matches #"[+-]?([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)([eE][+-]?[0-9]+)?" tok)
+    ;; no leading-dot alternative: `.5` never reaches here, it is a symbol
+    (re-matches #"[+-]?([0-9]+\.[0-9]*|[0-9]+)([eE][+-]?[0-9]+)?" tok)
     #?(:clj (Double/parseDouble ^String tok) :cljs (js/parseFloat tok))
 
     :else (reject! "EDN number is malformed" {:token tok})))
@@ -273,9 +290,35 @@
       (reject! "EDN auto-resolved keywords are forbidden" {:token tok})
       :else (keyword (subs tok 1)))
 
-    (re-matches #"[+-]?[.0-9].*" tok) (parse-number tok)
+    ;; A number starts with a DIGIT, optionally signed. A leading dot does
+    ;; not: `.`, `.5`, `-.5`, `...` and `.x` are all symbols to clojure.edn,
+    ;; and routing them to the number parser made this reader refuse
+    ;; `guest-grammar.edn` and `surface-status.edn` -- two of the workspace's
+    ;; own resource files, whose grammars use a bare `.` as a symbol.
+    (re-matches #"[+-]?[0-9].*" tok) (parse-number tok)
 
     :else (symbol tok)))
+
+(defn- qualify-map
+  "Apply a `#:ns{...}` prefix to a map's keys, as clojure.edn does: an
+  UNQUALIFIED keyword or symbol key gains the namespace, a key that already has
+  one keeps it, and any other key type is left alone.
+
+  This form is admitted, unlike every other `#` dispatch, because it names no
+  reader -- it is a shorthand for qualification and cannot run anything. Three
+  of this workspace's own resource files use it, so refusing it meant they
+  could never be read by this namespace at all."
+  [ns m]
+  (when (= ns "_") (reject! "EDN namespaced map with _ namespace is forbidden" {}))
+  (reduce-kv
+   (fn [out k v]
+     (assoc out
+            (cond
+              (and (keyword? k) (nil? (namespace k))) (keyword ns (name k))
+              (and (symbol? k) (nil? (namespace k)))  (symbol ns (name k))
+              :else k)
+            v))
+   (empty m) m))
 
 (declare read-form)
 
@@ -330,10 +373,22 @@
         (= c \\) (read-char-literal text i)
 
         (= c \#)
-        (if (and (< (inc i) n) (= (.charAt ^String text (inc i)) \{))
+        (cond
+          (and (< (inc i) n) (= (.charAt ^String text (inc i)) \{))
           (let [[items i'] (read-sequence text (+ i 2) \})]
             [(items->set items) i'])
-          (reject! "EDN dispatch forms are forbidden" {}))
+
+          (and (< (inc i) n) (= (.charAt ^String text (inc i)) \:))
+          (let [brace (loop [j (+ i 2)]
+                        (cond (>= j n) (reject! "EDN namespaced map is unterminated" {})
+                              (= (.charAt ^String text j) \{) j
+                              :else (recur (inc j))))
+                ns    (subs text (+ i 2) brace)
+                [items i'] (read-sequence text (inc brace) \})]
+            (when (empty? ns) (reject! "EDN namespaced map has no namespace" {}))
+            [(qualify-map ns (pairs->map items)) i'])
+
+          :else (reject! "EDN dispatch forms are forbidden" {}))
 
         (= c \() (let [[items i'] (read-sequence text (inc i) \))] [(apply list items) i'])
         (= c \[) (let [[items i'] (read-sequence text (inc i) \])] [items i'])
