@@ -243,3 +243,146 @@
     (when (> (utf8-size text) max-edn-bytes)
       (reject! "EDN output exceeds byte limit" {:limit max-edn-bytes}))
     text))
+
+;; ---------------------------------------------------------------------------
+;; read-all — the bounded answer to `clojure.edn/read` on a stream
+;; ---------------------------------------------------------------------------
+;;
+;; `read-string` above is single-form on purpose: it REJECTS trailing forms
+;; rather than silently returning the first one. That is the right default for
+;; a config file, and it must not change.
+;;
+;; But it leaves one real call shape unserved. The `clojure.edn/read` sites in
+;; this workspace are not reading one form -- they are draining a file of
+;; successive forms with an `:eof` sentinel:
+;;
+;;     (let [rdr (PushbackReader. (io/reader f))]
+;;       (loop [acc []]
+;;         (let [v (edn/read {:eof ::eof} rdr)]
+;;           (if (= v ::eof) acc (recur (conj acc v))))))
+;;
+;; Reproducing that shape would mean taking a host reader -- ambient I/O
+;; authority, and unboundable: you cannot preflight a stream you have not read.
+;; So the kotoba face is not a reader-taking `read`; it is `read-all` over
+;; text the caller already obtained through a granted filesystem handle
+;; (`kotoba.lang.fs`). The whole loop above becomes:
+;;
+;;     (edn/read-all (fs/read handle path))
+;;
+;; The `:eof` sentinel disappears with the loop -- end of input is the end of
+;; the vector, so there is no sentinel value to leak into the data and no way
+;; to confuse "the file ended" with "the file contained ::eof".
+;;
+;; Every bound `read-string` enforces still applies: the whole text is size-
+;; and syntax-checked once, and each form is shape-checked individually.
+
+(defn- span-reject! [message index]
+  (reject! message {:index index}))
+
+(defn- form-spans
+  "Index spans `[start end)` of each top-level form in `text`, in order.
+
+  Same lexer as `preflight!` (strings, escapes, `;` comments, `#{`), but it
+  records where each top-level form begins and ends instead of counting them.
+  Refuses the same malformed input `preflight!` refuses; it does not refuse
+  multiple forms, which is the entire point."
+  [text]
+  (let [n (count text)]
+    (loop [i 0, stack [], token? false, in-string? false, escaped? false,
+           in-comment? false, start nil, spans []]
+      (cond
+        (>= i n)
+        (do (when in-string? (span-reject! "EDN string is unterminated" i))
+            (when (seq stack) (span-reject! "EDN collection is unterminated" i))
+            (if start (conj spans [start n]) spans))
+
+        :else
+        (let [ch    (.charAt ^String text i)
+              depth (count stack)]
+          (cond
+            in-comment?
+            (recur (inc i) stack token? in-string? false (not= ch \newline) start spans)
+
+            (and in-string? escaped?)
+            (recur (inc i) stack token? true false false start spans)
+
+            (and in-string? (= ch \\))
+            (recur (inc i) stack token? true true false start spans)
+
+            in-string?
+            (if (= ch \")
+              (if (zero? depth)
+                (recur (inc i) stack false false false false nil (conj spans [start (inc i)]))
+                (recur (inc i) stack false false false false start spans))
+              (recur (inc i) stack token? true false false start spans))
+
+            ;; A bare top-level token ends at the first character that cannot
+            ;; continue it. Close the span and re-process this same character
+            ;; with token? false -- progress is guaranteed because the branch
+            ;; that sent us here cannot be taken twice for one index.
+            (and token? (zero? depth)
+                 (or (separator? ch) (closing? ch) (opening? ch)
+                     (= ch \;) (= ch \") (= ch \#)))
+            (recur i stack false false false false nil (conj spans [start i]))
+
+            (= ch \;)
+            (recur (inc i) stack token? false false true start spans)
+
+            (= ch \")
+            (recur (inc i) stack false true false false
+                   (if (zero? depth) i start) spans)
+
+            (= ch \#)
+            (if (and (< (inc i) n) (= (.charAt ^String text (inc i)) \{))
+              (let [next-stack (conj stack \})]
+                (when (> (count next-stack) max-depth)
+                  (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+                (recur (+ i 2) next-stack false false false false
+                       (if (zero? depth) i start) spans))
+              (reject! "EDN dispatch forms are forbidden" {}))
+
+            (opening? ch)
+            (let [next-stack (conj stack (matching-close ch))]
+              (when (> (count next-stack) max-depth)
+                (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+              (recur (inc i) next-stack false false false false
+                     (if (zero? depth) i start) spans))
+
+            (closing? ch)
+            (do
+              (when (or (empty? stack) (not= ch (peek stack)))
+                (span-reject! "EDN collection delimiters do not match" i))
+              (let [next-stack (pop stack)]
+                (if (empty? next-stack)
+                  (recur (inc i) next-stack false false false false nil
+                         (conj spans [start (inc i)]))
+                  (recur (inc i) next-stack false false false false start spans))))
+
+            (separator? ch)
+            (recur (inc i) stack false false false false start spans)
+
+            :else
+            (recur (inc i) stack true false false false
+                   (if (and (zero? depth) (nil? start)) i start) spans)))))))
+
+(defn read-all
+  "Read EVERY top-level form in `text`, returning a vector in source order.
+
+  The bounded, capability-free replacement for a `clojure.edn/read` loop over
+  a `PushbackReader` with an `:eof` sentinel: obtain the text through a granted
+  filesystem handle, then call this. End of input is the end of the vector, so
+  there is no sentinel value to choose or to leak into the data.
+
+  Empty input (blank, or only comments) reads as `[]` -- NOT an error, because
+  `[]` is the honest answer for a file that holds no forms, and the caller can
+  tell it apart from a file it failed to read (that throws). Each form is
+  bounded and shape-checked exactly as `read-string` bounds a single one.
+
+  Reader evaluation and tagged literals stay forbidden."
+  [text]
+  (when-not (string? text)
+    (reject! "EDN input must be text" {}))
+  (when (> (utf8-size text) max-edn-bytes)
+    (reject! "EDN input exceeds byte limit" {:limit max-edn-bytes}))
+  (mapv (fn [[start end]] (read-string (subs text start end)))
+        (form-spans text)))

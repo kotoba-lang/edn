@@ -152,3 +152,73 @@
       (let [out (edn/escape-controls (str "{:a 1,\n :b \"x" (char 0) "y\"}"))]
         (is (str/includes? out "\\u0000"))
         (is (= 1 (count (filter #(= \newline %) out))))))))
+
+;; ---------------------------------------------------------------------------
+;; read-all
+;; ---------------------------------------------------------------------------
+
+(deftest read-all-returns-every-top-level-form-in-order
+  (is (= [{:a 1} [2 3] :kw "s" 42]
+         (edn/read-all "{:a 1}\n[2 3]\n:kw \"s\" 42")))
+  ;; one form is still a vector of one -- the return shape does not change
+  ;; with the number of forms, so a caller never has to branch on it
+  (is (= [{:a 1}] (edn/read-all "{:a 1}")))
+  (is (= [1 2 3] (edn/read-all "1 2 3")))
+  (is (= [#{1 2}] (edn/read-all "#{1 2}"))))
+
+(deftest read-all-on-empty-input-is-empty-not-an-error
+  ;; Question 1 of the 8: what does it return with no input? `[]` here is a
+  ;; deliberate answer, not an accident -- a file that failed to read throws,
+  ;; so the caller can still tell the two apart.
+  (is (= [] (edn/read-all "")))
+  (is (= [] (edn/read-all "   \n\t ")))
+  (is (= [] (edn/read-all ";; only a comment\n")))
+  ;; contrast: read-string refuses the same input rather than inventing a value
+  (is (rejected "")))
+
+(deftest read-all-separates-forms-that-touch
+  ;; The lexer cases that a naive "split on newline" gets wrong.
+  (is (= [1 2] (edn/read-all "1,2")))
+  (is (= [[1] [2]] (edn/read-all "[1][2]")))
+  (is (= ["a" "b"] (edn/read-all "\"a\"\"b\"")))
+  (is (= ['sym [1]] (edn/read-all "sym[1]")))
+  (is (= [:a "b"] (edn/read-all ":a\"b\"")))
+  ;; a separator INSIDE a string is not a form boundary
+  (is (= ["a b\nc"] (edn/read-all "\"a b\nc\"")))
+  ;; nor is a `;` inside a string a comment
+  (is (= ["; not a comment" 1] (edn/read-all "\"; not a comment\" 1")))
+  ;; nor is an escaped quote the end of the string
+  (is (= ["a\"b" 1] (edn/read-all "\"a\\\"b\" 1"))))
+
+(deftest read-all-keeps-every-bound-read-string-enforces
+  ;; It is not a hole in the bounds: malformed and forbidden input is refused
+  ;; exactly as read-string refuses it.
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "[1 2")))
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "\"unterminated")))
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "[1} 2")))
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "#inst \"2026\"")))
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all 42)))
+  ;; and a LATER form being bad fails the whole read -- it does not return the
+  ;; good prefix and drop the rest silently
+  (is (thrown? #?(:clj Exception :cljs :default) (edn/read-all "{:a 1} [1 2"))))
+
+(deftest read-all-matches-a-clojure-edn-read-eof-loop
+  ;; Parity against the call shape this replaces. Without this the tests above
+  ;; only pin what I believed a drain loop returns.
+  (letfn [(host-drain [text]
+            #?(:clj (let [r (java.io.PushbackReader. (java.io.StringReader. text))]
+                      (loop [acc []]
+                        (let [v (clojure.edn/read {:eof ::eof} r)]
+                          (if (= v ::eof) acc (recur (conj acc v))))))
+               :cljs (cljs.reader/read-string (str "[" text "]"))))]
+    (doseq [text ["{:a 1}\n[2 3]\n:kw \"s\" 42"
+                  "1 2 3"
+                  "1,2"
+                  "[1][2]"
+                  "sym[1]"
+                  ":a\"b\""
+                  "\"; not a comment\" 1"
+                  ";; only a comment\n"
+                  "   \n\t "
+                  "{:a 1}"]]
+      (is (= (vec (host-drain text)) (edn/read-all text)) (pr-str text)))))
