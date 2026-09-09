@@ -1,5 +1,18 @@
 {:paths ["src"]
  :deps {
+        io.github.kotoba-lang/edn-escape-controls
+        {:git/url "https://github.com/kotoba-lang/edn-escape-controls.git"
+         :git/sha "4efa636a30f7e8389d9dce2086639b2168d5f55f"}
+        io.github.kotoba-lang/edn-read-all
+        {:git/url "https://github.com/kotoba-lang/edn-read-all.git"
+         :git/sha "bd989eb50d58e0a132b960bba7a6aca5fb9f3921"}
+        io.github.kotoba-lang/edn-read-string
+        {:git/url "https://github.com/kotoba-lang/edn-read-string.git"
+         :git/sha "4e839aaf3aea71aaa07d86f60ebd09f86c4a0697"}
+        io.github.kotoba-lang/edn-write-string
+        {:git/url "https://github.com/kotoba-lang/edn-write-string.git"
+         :git/sha "1450e5d0cbd31f858dd01e0fdc7b9a786396345f"}
+
         ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
         ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
         ;; this repo silently rides whatever a sibling happens to name.
