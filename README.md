@@ -31,8 +31,8 @@ members, and reader eval fail closed. The completed compatibility profile is rec
 ## Verify
 
 ```sh
-clojure -M:test
+kbb -M:test
 npm install
 npm test
-clojure -M:lint
+kbb -M:lint
 ```
