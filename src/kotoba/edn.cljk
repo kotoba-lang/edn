@@ -10,6 +10,7 @@
   on kotoba.lang.edn, where three assertions passed against nothing at all.
   Require the repo that defines the value.
 "
+  {:kotoba/export [escape-controls read-all read-string write-string]}
   (:refer-clojure :exclude [read-string])
   (:require [kotoba.edn.escape-controls :as escape-controls-ns]
             [kotoba.edn.read-all :as read-all-ns]

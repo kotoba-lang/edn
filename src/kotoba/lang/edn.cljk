@@ -4,6 +4,7 @@
   Reader evaluation and tagged literals are forbidden. Input size, nesting,
   token length, node count, and string length are all bounded before values
   cross an actor or I/O boundary."
+  {:kotoba/export [escape-controls max-depth max-edn-bytes max-exact-integer max-nodes max-string-chars max-token-chars read-all read-string write-string]}
   (:refer-clojure :exclude [read-string]))
 
 (def max-edn-bytes (* 8 1024 1024))
