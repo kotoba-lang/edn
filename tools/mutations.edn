@@ -1,5 +1,5 @@
 ;; One mutation per invariant. `:find` must occur EXACTLY ONCE in `:file` —
-;; `tools/mutate.cljs` refuses otherwise, because a mutation landing in a
+;; `tools/mutate.cljk` refuses otherwise, because a mutation landing in a
 ;; comment or a second call site produces a red suite that proves nothing.
 ;;
 ;; ## SCOPE
@@ -11,13 +11,13 @@
 ;; measured".
 [{:id :every-control-is-escaped
   :invariant "total: no input produces a raw control byte in the output"
-  :file "src/kotoba/lang/edn.cljc"
+  :file "src/kotoba/lang/edn.cljk"
   :find "(if (and (or (< code 32) (= code 127))"
   :replace "(if (and (or (< code 8) (= code 127))"}
 
  {:id :del-is-a-control-too
   :invariant "U+007F makes file(1) say `data` exactly as U+0000 does"
-  :file "src/kotoba/lang/edn.cljc"
+  :file "src/kotoba/lang/edn.cljk"
   :find "(< code 32) (= code 127))"
   :replace "(< code 32) (= code 128))"}
 
@@ -34,24 +34,24 @@
  ;; TESTS, not in the guard. Both are back.
  {:id :layout-whitespace-is-not-escaped
   :invariant "structural newlines survive; escaping them destroys the document"
-  :file "src/kotoba/lang/edn.cljc"
+  :file "src/kotoba/lang/edn.cljk"
   :find "#{9 10 13})"
   :replace "  #{})"}
 
  {:id :the-escape-is-four-hex-digits
   :invariant "\\u0 is not an EDN escape; the reader would not take it back"
-  :file "src/kotoba/lang/edn.cljc"
+  :file "src/kotoba/lang/edn.cljk"
   :find "(str (subs \"0000\" 0 (- 4 (count h))) h)"
   :replace "h"}
 
  {:id :the-byte-limit-is-applied-after-escaping
   :invariant "one control becomes six; the limit is on what is written"
-  :file "src/kotoba/lang/edn.cljc"
+  :file "src/kotoba/lang/edn.cljk"
   :find "  (let [text (escape-controls (pr-str (validate-shape! value)))]"
   :replace "  (let [text (pr-str (validate-shape! value))]"}
 
  {:id :escaping-does-not-rewrite-innocent-text
   :invariant "a value with no controls comes out exactly as pr-str wrote it"
-  :file "src/kotoba/lang/edn.cljc"
+  :file "src/kotoba/lang/edn.cljk"
   :find "                          (str \"\\\\u\""
   :replace "                          (str \"X\\\\u\""}]

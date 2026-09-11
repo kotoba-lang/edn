@@ -115,9 +115,9 @@
 
 (deftest this-namespace-no-longer-requires-a-host-reader
   ;; Evidence floor first: an unreadable source must not pass as clean.
-  (let [src #?(:clj  (slurp "src/kotoba/lang/edn.cljc")
+  (let [src #?(:clj  (slurp "src/kotoba/lang/edn.cljk")
                :cljs (.readFileSync (js/require "node:fs")
-                                    "src/kotoba/lang/edn.cljc" "utf8"))]
+                                    "src/kotoba/lang/edn.cljk" "utf8"))]
     (is (< 8000 (count src)) "edn.cljc source was actually read")
     (is (not (re-find #"\[clojure\.edn" src)))
     (is (not (re-find #"\[cljs\.reader" src)))

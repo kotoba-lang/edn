@@ -9,8 +9,8 @@
 
   Usage (from the repo root):
 
-      nbb tools/mutate.cljs             # every mutation in the table
-      nbb tools/mutate.cljs :duplicate  # one, by id
+      nbb tools/mutate.cljk             # every mutation in the table
+      nbb tools/mutate.cljk :duplicate  # one, by id
 
   The table lives in `tools/mutations.edn`. Each entry names the invariant,
   the file, an EXACT substring to find (it must occur exactly once — a
