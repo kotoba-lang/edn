@@ -1,7 +1,7 @@
 {:schema :kotoba.edn-migration/v1
  :profile :kotoba.edn/bounded-v1
  :cljc
- {:source "src/kotoba/lang/edn.cljc"
+ {:source "src/kotoba/lang/edn.cljk"
   :authority :portable-host-oracle
   :surface [:read-string :write-string]
   :forbidden [:reader-eval :tagged-literals :discard-forms]
