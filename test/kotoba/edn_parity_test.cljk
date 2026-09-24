@@ -9,7 +9,7 @@
   Inputs where the two host readers disagree WITH EACH OTHER are not in the
   parity corpus. They are the reason this reader exists, and they are pinned
   below as refusals."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.edn :as host] :cljs [cljs.reader :as host])
             [kotoba.edn :as edn]
             [kotoba.edn.max-depth]))

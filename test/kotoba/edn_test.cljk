@@ -1,6 +1,6 @@
 (ns kotoba.edn-test
   (:require [kotoba.lang.text :as str]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.edn :as edn]
             [kotoba.edn.max-edn-bytes]
             [kotoba.edn.max-depth]
