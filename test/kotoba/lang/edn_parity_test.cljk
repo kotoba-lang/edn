@@ -10,7 +10,7 @@
   parity corpus. They are the reason this reader exists, and they are pinned
   below as refusals."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.edn :as host] :cljs [cljs.reader :as host])
+            #?(:clj [kotoba.lang.edn :as host] :cljs [cljs.reader :as host])
             [kotoba.lang.edn :as edn]))
 
 ;; ---------------------------------------------------------------------------
