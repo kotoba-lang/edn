@@ -21,17 +21,17 @@
      :cljs (.-length (.encode (js/TextEncoder.) text))))
 
 (defn- opening? [ch]
-  (or (= ch \() (= ch \[) (= ch \{)))
+  (or (= ch "(") (= ch "[") (= ch "{")))
 
 (defn- closing? [ch]
-  (or (= ch \)) (= ch \]) (= ch \})))
+  (or (= ch ")") (= ch "]") (= ch "}")))
 
 (defn- matching-close [ch]
-  (case ch \( \) \[ \] \{ \}))
+  (case ch "(" ")" "[" "]" "{" "}"))
 
 (defn- separator? [ch]
-  (or (= ch \,) (= ch \space) (= ch \tab)
-      (= ch \newline) (= ch \return)))
+  (or (= ch ",") (= ch " ") (= ch "\t")
+      (= ch "\n") (= ch "\r")))
 
 (defn- preflight!
   "Bound and syntax-check `text` before any value is built. `allow-tags?` is
@@ -54,45 +54,45 @@
         (cond
           in-comment?
           (recur (inc index) stack 0 false false false
-                 (not= ch \newline) forms)
+                 (not= ch "\n") forms)
 
           (and in-string? escaped?)
           (recur (inc index) stack 0 false true false false forms)
 
-          (and in-string? (= ch \\))
+          (and in-string? (= ch "\\"))
           (recur (inc index) stack 0 false true true false forms)
 
           in-string?
-          (recur (inc index) stack 0 false (not= ch \") false false forms)
+          (recur (inc index) stack 0 false (not= ch "\"") false false forms)
 
-          (= ch \;)
+          (= ch ";")
           (recur (inc index) stack 0 false false false true forms)
 
-          (= ch \")
+          (= ch "\"")
           (recur (inc index) stack 0 false true false false
                  (if (zero? depth) (inc forms) forms))
 
-          (= ch \#)
+          (= ch "#")
           ;; Two dispatch forms are admitted and no others: `#{` (a set) and
           ;; `#:ns{` (a namespaced map). Both are pure data shapes -- neither
           ;; names a reader, so neither can run anything. Every other `#` is
           ;; still refused, tagged literals included.
           (let [nxt (when (< (inc index) (count text)) (.charAt text (inc index)))
                 ;; for `#:ns{`, walk the namespace token to the brace
-                ns-end (when (= nxt \:)
+                ns-end (when (= nxt ":")
                          (loop [j (+ index 2)]
                            (cond
                              (>= j (count text)) nil
-                             (= (.charAt text j) \{) j
+                             (= (.charAt text j) "{") j
                              (or (separator? (.charAt text j))
                                  (opening? (.charAt text j))
                                  (closing? (.charAt text j))) nil
                              :else (recur (inc j)))))
-                brace-at (cond (= nxt \{) (inc index)
+                brace-at (cond (= nxt "{") (inc index)
                                ns-end     ns-end)]
             (cond
               brace-at
-              (let [next-stack (conj stack \})]
+              (let [next-stack (conj stack "}")]
                 (when (> (count next-stack) max-depth)
                   (reject! "EDN nesting exceeds limit" {:limit max-depth}))
                 (recur (inc brace-at) next-stack 0 false false false false
@@ -202,9 +202,9 @@
       (cond
         (>= i n) i
         (separator? (.charAt ^String text i)) (recur (inc i))
-        (= (.charAt ^String text i) \;)
+        (= (.charAt ^String text i) ";")
         (recur (loop [j i]
-                 (if (or (>= j n) (= (.charAt ^String text j) \newline)) j (recur (inc j)))))
+                 (if (or (>= j n) (= (.charAt ^String text j) "\n")) j (recur (inc j)))))
         :else i))))
 
 (defn- read-string-literal
@@ -215,20 +215,20 @@
       (when (>= j n) (reject! "EDN string is unterminated" {}))
       (let [c (.charAt ^String text j)]
         (cond
-          (= c \") [(apply str out) (inc j)]
+          (= c "\"") [(apply str out) (inc j)]
 
-          (= c \\)
+          (= c "\\")
           (let [e (when (< (inc j) n) (.charAt ^String text (inc j)))]
             (cond
-              (= e \") (recur (+ j 2) (conj out \"))
-              (= e \\) (recur (+ j 2) (conj out \\))
-              (= e \/) (recur (+ j 2) (conj out \/))
-              (= e \b) (recur (+ j 2) (conj out (char 8)))
-              (= e \f) (recur (+ j 2) (conj out (char 12)))
-              (= e \n) (recur (+ j 2) (conj out \newline))
-              (= e \r) (recur (+ j 2) (conj out \return))
-              (= e \t) (recur (+ j 2) (conj out \tab))
-              (= e \u)
+              (= e "\"") (recur (+ j 2) (conj out "\""))
+              (= e "\\") (recur (+ j 2) (conj out "\\"))
+              (= e "/") (recur (+ j 2) (conj out "/"))
+              (= e "b") (recur (+ j 2) (conj out (char 8)))
+              (= e "f") (recur (+ j 2) (conj out (char 12)))
+              (= e "n") (recur (+ j 2) (conj out "\n"))
+              (= e "r") (recur (+ j 2) (conj out "\r"))
+              (= e "t") (recur (+ j 2) (conj out "\t"))
+              (= e "u")
               (let [hex (when (<= (+ j 6) n) (subs text (+ j 2) (+ j 6)))]
                 (if (and hex (re-matches #"[0-9a-fA-F]{4}" hex))
                   (recur (+ j 6) (conj out (char (hex->int hex))))
@@ -239,7 +239,7 @@
           :else (recur (inc j) (conj out c)))))))
 
 (def ^:private named-chars
-  {"newline" \newline "space" \space "tab" \tab "return" \return
+  {"newline" "\n" "space" " " "tab" "\t" "return" "\r"
    "backspace" (char 8) "formfeed" (char 12)})
 
 (defn- read-char-literal
@@ -269,8 +269,8 @@
               (separator? (.charAt ^String text j))
               (opening? (.charAt ^String text j))
               (closing? (.charAt ^String text j))
-              (= (.charAt ^String text j) \")
-              (= (.charAt ^String text j) \;))
+              (= (.charAt ^String text j) "\"")
+              (= (.charAt ^String text j) ";"))
         j
         (recur (inc j))))))
 
@@ -286,7 +286,7 @@
     (re-matches #"[+-]?[0-9]+/[0-9]+" tok)                 (refuse-imprecise! tok :number/ratio)
 
     (re-matches #"[+-]?[0-9]+" tok)
-    (let [magnitude (if (or (= \+ (.charAt ^String tok 0)) (= \- (.charAt ^String tok 0)))
+    (let [magnitude (if (or (= "+" (.charAt ^String tok 0)) (= "-" (.charAt ^String tok 0)))
                       (subs tok 1) tok)]
       ;; length first: a 400-digit literal must not be converted before it is
       ;; range-checked, or the conversion itself is the thing that loses it
@@ -307,7 +307,7 @@
     (= tok "true")  true
     (= tok "false") false
 
-    (= (.charAt ^String tok 0) \:)
+    (= (.charAt ^String tok 0) ":")
     (cond
       (= tok ":")                  (reject! "EDN keyword is empty" {})
       (= (subs tok 0 (min 2 (count tok))) "::")
@@ -405,22 +405,22 @@
     (when (>= i n) (reject! "EDN input is empty" {}))
     (let [c (.charAt ^String text i)]
       (cond
-        (= c \") (read-string-literal text i)
-        (= c \\) (read-char-literal text i)
+        (= c "\"") (read-string-literal text i)
+        (= c "\\") (read-char-literal text i)
 
-        (= c \#)
+        (= c "#")
         (cond
-          (and (< (inc i) n) (= (.charAt ^String text (inc i)) \{))
-          (let [[items i'] (read-sequence text (+ i 2) \} opts)]
+          (and (< (inc i) n) (= (.charAt ^String text (inc i)) "{"))
+          (let [[items i'] (read-sequence text (+ i 2) "}" opts)]
             [(items->set items) i'])
 
-          (and (< (inc i) n) (= (.charAt ^String text (inc i)) \:))
+          (and (< (inc i) n) (= (.charAt ^String text (inc i)) ":"))
           (let [brace (loop [j (+ i 2)]
                         (cond (>= j n) (reject! "EDN namespaced map is unterminated" {})
-                              (= (.charAt ^String text j) \{) j
+                              (= (.charAt ^String text j) "{") j
                               :else (recur (inc j))))
                 ns    (subs text (+ i 2) brace)
-                [items i'] (read-sequence text (inc brace) \} opts)]
+                [items i'] (read-sequence text (inc brace) "}" opts)]
             (when (empty? ns) (reject! "EDN namespaced map has no namespace" {}))
             [(qualify-map ns (pairs->map items)) i'])
 
@@ -437,9 +437,9 @@
 
           :else (reject! "EDN dispatch forms are forbidden" {}))
 
-        (= c \() (let [[items i'] (read-sequence text (inc i) \) opts)] [(apply list items) i'])
-        (= c \[) (let [[items i'] (read-sequence text (inc i) \] opts)] [items i'])
-        (= c \{) (let [[items i'] (read-sequence text (inc i) \} opts)] [(pairs->map items) i'])
+        (= c "(") (let [[items i'] (read-sequence text (inc i) ")" opts)] [(apply list items) i'])
+        (= c "[") (let [[items i'] (read-sequence text (inc i) "]" opts)] [items i'])
+        (= c "{") (let [[items i'] (read-sequence text (inc i) "}" opts)] [(pairs->map items) i'])
 
         (closing? c) (reject! "EDN collection delimiters do not match" {})
 
@@ -707,16 +707,16 @@
                depth (count stack)]
            (cond
              in-comment?
-             (recur (inc i) stack token? in-string? false (not= ch \newline) start spans pending)
+             (recur (inc i) stack token? in-string? false (not= ch "\n") start spans pending)
 
              (and in-string? escaped?)
              (recur (inc i) stack token? true false false start spans pending)
 
-             (and in-string? (= ch \\))
+             (and in-string? (= ch "\\"))
              (recur (inc i) stack token? true true false start spans pending)
 
              in-string?
-             (if (= ch \")
+             (if (= ch "\"")
                (if (zero? depth)
                  (recur (inc i) stack false false false false nil (conj spans [start (inc i)]) 0)
                  (recur (inc i) stack false false false false start spans pending))
@@ -728,32 +728,32 @@
              ;; that sent us here cannot be taken twice for one index.
              (and token? (zero? depth)
                   (or (separator? ch) (closing? ch) (opening? ch)
-                      (= ch \;) (= ch \") (= ch \#)))
+                      (= ch ";") (= ch "\"") (= ch "#")))
              (recur i stack false false false false nil (conj spans [start i]) 0)
 
-             (= ch \;)
+             (= ch ";")
              (recur (inc i) stack token? false false true start spans pending)
 
-             (= ch \")
+             (= ch "\"")
              (recur (inc i) stack false true false false
                     (if (zero? depth) (or start i) start) spans pending)
 
-             (= ch \#)
+             (= ch "#")
              (let [nxt    (when (< (inc i) n) (.charAt ^String text (inc i)))
-                   ns-end (when (= nxt \:)
+                   ns-end (when (= nxt ":")
                             (loop [j (+ i 2)]
                               (cond
                                 (>= j n) nil
-                                (= (.charAt ^String text j) \{) j
+                                (= (.charAt ^String text j) "{") j
                                 (or (separator? (.charAt ^String text j))
                                     (opening? (.charAt ^String text j))
                                     (closing? (.charAt ^String text j))) nil
                                 :else (recur (inc j)))))
-                   brace  (cond (= nxt \{) (inc i)
+                   brace  (cond (= nxt "{") (inc i)
                                 ns-end     ns-end)]
                (cond
                  brace
-                 (let [next-stack (conj stack \})]
+                 (let [next-stack (conj stack "}")]
                    (when (> (count next-stack) max-depth)
                      (reject! "EDN nesting exceeds limit" {:limit max-depth}))
                    (recur (inc brace) next-stack false false false false
