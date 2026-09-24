@@ -71,7 +71,7 @@
   Slow, but it never strands a file."
   (:require ["node:child_process" :as cp]
             ["node:fs" :as fs]
-            [clojure.edn :as edn]
+            [kotoba.lang.edn :as edn]
             [kotoba.lang.text :as str]))
 
 (defn- orig-path [file] (str file ".orig"))
