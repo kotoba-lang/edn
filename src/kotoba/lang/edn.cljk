@@ -524,7 +524,11 @@
            (catch #?(:clj Exception :cljs :default) error
              (if (= :decode (:phase (ex-data error)))
                (throw error)
-               (throw (ex-info "EDN input was rejected" {:phase :decode} error))))))))))
+               ;; No cause on Kotoba: a cause is another Throwable and Kotoba
+               ;; has none (kotoba-lang lang/abort-ability.edn). The host
+               ;; keeps it, so ex-cause is unchanged there.
+               (throw #?(:kotoba (ex-info "EDN input was rejected" {:phase :decode})
+                         :default (ex-info "EDN input was rejected" {:phase :decode} error)))))))))))
 
 (def ^:private literal-controls
   "The C0 controls text keeps literal: tab, newline, carriage return.
