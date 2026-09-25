@@ -5,7 +5,8 @@
   token length, node count, and string length are all bounded before values
   cross an actor or I/O boundary."
   {:kotoba/export [escape-controls max-depth max-edn-bytes max-exact-integer max-nodes max-string-chars max-token-chars read-all read-string write-string]}
-  (:refer-clojure :exclude [read-string]))
+  (:refer-clojure :exclude [read-string])
+  (:require [kotoba.bytes :as kbytes]))
 
 (def max-edn-bytes (* 8 1024 1024))
 (def max-depth 128)
@@ -17,7 +18,7 @@
   (throw (ex-info message (merge {:phase :decode} data))))
 
 (defn- utf8-size [text]
-  #?(:clj (alength (.getBytes ^String text "UTF-8"))
+  #?(:clj (alength (kbytes/utf8-bytes ^String text))
      :cljs (.-length (.encode (js/TextEncoder.) text))))
 
 (defn- opening? [ch]

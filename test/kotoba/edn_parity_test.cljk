@@ -87,7 +87,7 @@
 
 (defn- refusal [input]
   (try (edn/read-string input) ::no-throw
-       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+       (catch :default e
          (or (:kotoba.lang.edn/reason (ex-data e)) (ex-data e)))))
 
 (deftest numbers-that-would-not-mean-the-same-on-every-host-are-refused
@@ -138,7 +138,7 @@
                        ["\\)" #"delimiters"]
                        ["\\\"" #"unterminated"]]]
     (let [e (try (edn/read-string input) nil
-                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e))]
+                 (catch :default e e))]
       (is (some? e) (pr-str input))
       (is (re-find msg (ex-message e)) (pr-str input))))
   ;; every other character literal reads
@@ -165,14 +165,14 @@
   ;; The whole risk of adding options is that the no-option path quietly
   ;; loosens. Every one of these is the behaviour from before options existed.
   (is (= :decode (:phase (ex-data (try (edn/read-string "#inst \"2026\"") nil
-                                       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e))))))
+                                       (catch :default e e))))))
   (is (not= ::no-throw (refusal "#inst \"2026\"")))
   (is (not= ::no-throw (refusal "#_ :discarded")))
   (is (not= ::no-throw (refusal "")))
   (is (not= ::no-throw (refusal "   ")))
   ;; and the empty options map is the strict default, not a relaxation
   (is (not= ::no-throw (try (edn/read-string {} "#inst \"2026\"") ::no-throw
-                            (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))))
+                            (catch :default _ :refused)))))
 
 (deftest readers-and-default-dispatch-like-clojure-edn
   (is (= {:inst "2026"}
@@ -192,7 +192,7 @@
   ;; a tag with NO handler is still refused even though other tags have one
   (is (not= ::no-throw
             (try (edn/read-string {:readers {'a identity}} "#b 1") ::no-throw
-                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+                 (catch :default _ :refused))))
   ;; the passthrough shape kotoba-lang/fmt needs
   (is (= {:a "2026"} (edn/read-string {:default (fn [_t v] v)} "{:a #inst \"2026\"}")))
   ;; nested, and inside every collection kind
@@ -208,16 +208,16 @@
     ;; trailing -- the lexer counts the value, not the tag
     (is (not= ::no-throw
               (try (edn/read-string opts "#a 1 #b 2") ::no-throw
-                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+                   (catch :default _ :refused))))
     ;; a tag with nothing after it is refused
     (is (not= ::no-throw
               (try (edn/read-string opts "#a") ::no-throw
-                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+                   (catch :default _ :refused))))
     ;; the depth bound still applies through a tag
     (with-redefs [kotoba.edn.max-depth/max-depth 4]
       (is (not= ::no-throw
                 (try (edn/read-string opts "#a [[[[[0]]]]]") ::no-throw
-                     (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))))))
+                     (catch :default _ :refused)))))))
 
 (deftest eof-answers-the-same-on-every-host
   ;; Measured 2026-09-08: `(clojure.edn/read-string {:eof s} "")` answers the
@@ -232,7 +232,7 @@
   (is (= 1 (edn/read-string {:eof ::none} "1")))
   (is (not= ::no-throw
             (try (edn/read-string {:eof ::none} "[1") ::no-throw
-                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+                 (catch :default _ :refused))))
   ;; without :eof, empty input still throws -- the option adds a case, it does
   ;; not change the default
   (is (not= ::no-throw (refusal ""))))
@@ -243,12 +243,12 @@
   (doseq [bad [{:reader {}} {:defaults (fn [_ v] v)} {:eof-value nil}]]
     (is (not= ::no-throw
               (try (edn/read-string bad "1") ::no-throw
-                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))
+                   (catch :default _ :refused)))
         (pr-str bad)))
   (is (not= ::no-throw (try (edn/read-string :not-a-map "1") ::no-throw
-                            (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused))))
+                            (catch :default _ :refused))))
   (is (not= ::no-throw (try (edn/read-string {:default :not-a-fn} "1") ::no-throw
-                            (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))))
+                            (catch :default _ :refused)))))
 
 (deftest read-all-takes-the-same-options-and-refuses-eof
   (is (= '[[a 1] [b 2]]
@@ -257,4 +257,4 @@
   ;; :eof would be meaningless here: the empty vector already IS the answer
   (is (not= ::no-throw
             (try (edn/read-all {:eof ::x} "1") ::no-throw
-                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) _ :refused)))))
+                 (catch :default _ :refused)))))

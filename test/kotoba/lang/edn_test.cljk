@@ -5,7 +5,7 @@
 
 (defn- rejected [input]
   (try (edn/read-string input) nil
-       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) error error)))
+       (catch :default error error)))
 
 (deftest bounded-roundtrip
   (doseq [value [nil true false 42 -7 "言葉" :actor/run
