@@ -4,157 +4,700 @@
   Reader evaluation and tagged literals are forbidden. Input size, nesting,
   token length, node count, and string length are all bounded before values
   cross an actor or I/O boundary."
-  {:kotoba/export [escape-controls max-depth max-edn-bytes max-exact-integer max-nodes max-string-chars max-token-chars read-all read-string write-string]}
+  {:kotoba/export #?(:kotoba [escape-controls max-depth max-edn-bytes max-exact-integer max-nodes max-string-chars max-token-chars read-all read-document write-string]
+                     :default [escape-controls max-depth max-edn-bytes max-exact-integer max-nodes max-string-chars max-token-chars read-all read-string write-string])}
   (:refer-clojure :exclude [read-string])
-  (:require [kotoba.bytes :as kbytes]))
+  (:require #?@(:kotoba [] :default [[kotoba.bytes :as kbytes]])))
 
-(def max-edn-bytes (* 8 1024 1024))
-(def max-depth 128)
-(def max-token-chars 4096)
-(def max-nodes 200000)
-(def max-string-chars (* 1024 1024))
 
-(defn- reject! [message data]
-  (throw (ex-info message (merge {:phase :decode} data))))
+;; ── the Kotoba reading ───────────────────────────────────────────────────────
+;;
+;; Dual-runtime (the posix-path idiom, amu src/kotoba/compiler/posix_path.cljk):
+;; `#?(:kotoba A :default B)` gives Kotoba its own reading; the host code below is
+;; unchanged. On Kotoba the value tree is a `:document`, bytes are UTF-8 offsets,
+;; the host's `throw` is an aborting export (`[:result T E]` on the Kotoba route),
+;; and the exported limits are zero-argument functions.
+;;
+;; The Kotoba reader is the SAME bounded lexer (`scan`: size, nesting, token
+;; length, single form, unterminated string or collection, dispatch forms) in
+;; front of the language's own safe EDN reader, `document-edn-read`, which reads
+;; no tag and evaluates nothing. Where the host's parser reads something the
+;; language's reader does not, the Kotoba reading REFUSES rather than reading a
+;; different value:
+;;   * `#:ns{...}` namespaced maps and character literals (`\a`): refused;
+;;   * the host-divergent numbers (1N, 1.5M, 1/2, integers past 2^53-1): refused
+;;     with the host's message;
+;;   * a map with a DUPLICATE key is refused by the host with a typed abort; the
+;;     language reader refuses it too, but as a runtime trap that no `try` can
+;;     catch (the odd-length map, the other map error, is caught by `scan`);
+;;   * `read-string` is a reserved name in the language, so the Kotoba name of
+;;     `read-string` is `read-document` (the name `kotoba.edn` already uses);
+;;   * the options of `read-string` / `read-all` (`:readers`, `:default`, `:eof`)
+;;     are function values, which have no Kotoba spelling: only the option-free
+;;     call exists.
+;; `write-string` prints with `document-edn-print`, as `kotoba.lang.canonical-document`
+;; does, so a map prints in sorted order without commas where `pr-str` does not.
 
-(defn- utf8-size [text]
-  #?(:clj (alength (kbytes/utf8-bytes ^String text))
-     :cljs (.-length (.encode (js/TextEncoder.) text))))
+#?(:kotoba
+   (defn max-edn-bytes [] :i64 8388608))
+#?(:kotoba
+   (defn max-depth [] :i64 128))
+#?(:kotoba
+   (defn max-token-chars [] :i64 4096))
+#?(:kotoba
+   (defn max-nodes [] :i64 200000))
+#?(:kotoba
+   (defn max-string-chars [] :i64 1048576))
+#?(:kotoba
+   (defn max-exact-integer [] :i64 9007199254740991))
 
-(defn- opening? [ch]
-  (or (= ch "(") (= ch "[") (= ch "{")))
+#?(:kotoba
+   (defn- utf8-width [cp :i64] :i64
+     (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4)))
 
-(defn- closing? [ch]
-  (or (= ch ")") (= ch "]") (= ch "}")))
+#?(:kotoba
+   (defn- separator-code? [c :i64] :bool
+     (if (= c 44) true (if (= c 32) true (if (= c 9) true (if (= c 10) true (= c 13)))))))
 
-(defn- matching-close [ch]
-  (case ch "(" ")" "[" "]" "{" "}"))
+#?(:kotoba
+   (defn- opening-code? [c :i64] :bool
+     (if (= c 40) true (if (= c 91) true (= c 123)))))
 
-(defn- separator? [ch]
-  (or (= ch ",") (= ch " ") (= ch "\t")
-      (= ch "\n") (= ch "\r")))
+#?(:kotoba
+   (defn- closing-code? [c :i64] :bool
+     (if (= c 41) true (if (= c 93) true (= c 125)))))
 
-(defn- preflight!
-  "Bound and syntax-check `text` before any value is built. `allow-tags?` is
-  false unless the caller supplied a `:readers` or `:default` option: a tagged
-  literal is admitted by the LEXER only when someone has said what to do with
-  it, so the strict default cannot be widened by accident."
-  ([text] (preflight! text false))
-  ([text allow-tags?]
-  (loop [index 0 stack [] token-length 0 token? false
-         in-string? false escaped? false in-comment? false forms 0]
-    (if (>= index (count text))
-      (do
-        (when in-string? (reject! "EDN string is unterminated" {}))
-        (when (seq stack) (reject! "EDN collection is unterminated" {}))
-        (when (zero? forms) (reject! "EDN input is empty" {}))
-        (when (> forms 1) (reject! "EDN input contains trailing forms" {}))
-        text)
-      (let [ch (.charAt text index)
-            depth (count stack)]
-        (cond
-          in-comment?
-          (recur (inc index) stack 0 false false false
-                 (not= ch "\n") forms)
+#?(:kotoba
+   (defn- matching-close-code [c :i64] :i64
+     (if (= c 40) 41 (if (= c 91) 93 125))))
 
-          (and in-string? escaped?)
-          (recur (inc index) stack 0 false true false false forms)
+#?(:kotoba
+   (defn- pop-stack [v :vector-i64] :vector-i64
+     (let [n (vector-count v)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i (- n 1)) out (recur (+ i 1) (vector-conj out (vector-at v i))))))))
 
-          (and in-string? (= ch "\\"))
-          (recur (inc index) stack 0 false true true false forms)
+#?(:kotoba
+   ;; -1 when the stack is empty
+   (defn- top-of [v :vector-i64] :i64
+     (if (= (vector-count v) 0) -1 (vector-at v (- (vector-count v) 1)))))
 
-          in-string?
-          (recur (inc index) stack 0 false (not= ch "\"") false false forms)
+;; The lexer. Its state travels in the loop: position, the stack of expected
+;; closers, the length of the token being read (0 when none), string/escape/comment
+;; flags, the start of the top-level form in progress (-1 when none), the spans of
+;; the finished forms as flat start/end pairs, and every bare token as start/end
+;; pairs (checked afterwards, so the loop itself only aborts on paths that leave it).
+;; `counts` is the number of forms read so far in each open collection (parallel to
+;; `stack`), so that a map with an odd number of forms is refused here, as the host
+;; refuses it, rather than reaching the language's reader, which cannot abort.
+#?(:kotoba
+   (defn- bump [counts :vector-i64] :vector-i64
+     (let [n (vector-count counts)]
+       (if (= n 0)
+         counts
+         (vector-assoc counts (- n 1) (+ 1 (vector-at counts (- n 1))))))))
 
-          (= ch ";")
-          (recur (inc index) stack 0 false false false true forms)
+#?(:kotoba
+   (defn- odd-map-close? [c :i64 counts :vector-i64] :bool
+     (if (= c 125)
+       (if (> (vector-count counts) 0)
+         (= 1 (- (top-of counts) (* 2 (quot (top-of counts) 2))))
+         false)
+       false)))
 
-          (= ch "\"")
-          (recur (inc index) stack 0 false true false false
-                 (if (zero? depth) (inc forms) forms))
+#?(:kotoba
+   (defn- scan-loop [text :string n :i64] :document
+     (loop [i 0 stack (vector-i64) counts (vector-i64) tlen 0 in-string? false escaped? false in-comment? false
+            start -1 spans (vector-i64) toks (vector-i64) tstart -1]
+       (if (>= i n)
+         (cond
+           in-string? (throw (ex-info "EDN string is unterminated" {:phase :decode}))
+           (> (vector-count stack) 0) (throw (ex-info "EDN collection is unterminated" {:phase :decode}))
+           :else
+           (let [toks2 (if (> tlen 0) (vector-conj (vector-conj toks tstart) n) toks)
+                 spans2 (if (>= start 0) (vector-conj (vector-conj spans start) n) spans)]
+             (document-vector (dvec spans2) (dvec toks2))))
+         (let [c (string-code-point-at text i)
+               w (utf8-width c)
+               depth (vector-count stack)]
+           (cond
+             in-comment?
+             (recur (+ i w) stack counts 0 false false (not (= c 10)) start spans toks -1)
 
-          (= ch "#")
-          ;; Two dispatch forms are admitted and no others: `#{` (a set) and
-          ;; `#:ns{` (a namespaced map). Both are pure data shapes -- neither
-          ;; names a reader, so neither can run anything. Every other `#` is
-          ;; still refused, tagged literals included.
-          (let [nxt (when (< (inc index) (count text)) (.charAt text (inc index)))
-                ;; for `#:ns{`, walk the namespace token to the brace
-                ns-end (when (= nxt ":")
-                         (loop [j (+ index 2)]
-                           (cond
-                             (>= j (count text)) nil
-                             (= (.charAt text j) "{") j
-                             (or (separator? (.charAt text j))
-                                 (opening? (.charAt text j))
-                                 (closing? (.charAt text j))) nil
-                             :else (recur (inc j)))))
-                brace-at (cond (= nxt "{") (inc index)
-                               ns-end     ns-end)]
-            (cond
-              brace-at
-              (let [next-stack (conj stack "}")]
-                (when (> (count next-stack) max-depth)
-                  (reject! "EDN nesting exceeds limit" {:limit max-depth}))
-                (recur (inc brace-at) next-stack 0 false false false false
-                       (if (zero? depth) (inc forms) forms)))
+             (if in-string? escaped? false)
+             (recur (+ i w) stack counts 0 true false false start spans toks -1)
 
-              ;; `#tag value` -- skip the TAG token here and let the value that
-              ;; follows be lexed and counted normally, so `#inst "x"` is one
-              ;; top-level form and `#inst "x" #inst "y"` is still two (and so
-              ;; still refused as trailing).
-              (and allow-tags? nxt (not (separator? nxt))
-                   (not (opening? nxt)) (not (closing? nxt)))
-              (recur (loop [j (inc index)]
-                       (if (or (>= j (count text))
-                               (separator? (.charAt text j))
-                               (opening? (.charAt text j))
-                               (closing? (.charAt text j)))
-                         j
-                         (recur (inc j))))
-                     stack 0 false false false false forms)
+             (if in-string? (= c 92) false)
+             (recur (+ i w) stack counts 0 true true false start spans toks -1)
 
-              :else (reject! "EDN dispatch forms are forbidden" {})))
+             in-string?
+             (if (= c 34)
+               (if (= depth 0)
+                 (recur (+ i w) stack counts 0 false false false -1 (vector-conj (vector-conj spans start) (+ i w)) toks -1)
+                 (recur (+ i w) stack (bump counts) 0 false false false start spans toks -1))
+               (recur (+ i w) stack counts 0 true false false start spans toks -1))
 
-          (opening? ch)
-          (let [next-stack (conj stack (matching-close ch))]
-            (when (> (count next-stack) max-depth)
-              (reject! "EDN nesting exceeds limit" {:limit max-depth}))
-            (recur (inc index) next-stack 0 false false false false
-                   (if (zero? depth) (inc forms) forms)))
+             ;; a top-level bare token ends at the first character that cannot continue it
+             (if (> tlen 0)
+               (if (= depth 0)
+                 (if (separator-code? c) true (if (closing-code? c) true (if (opening-code? c) true (if (= c 59) true (if (= c 34) true (= c 35))))))
+                 false)
+               false)
+             (recur i stack counts 0 false false false -1
+                    (vector-conj (vector-conj spans start) i) (vector-conj (vector-conj toks tstart) i) -1)
 
-          (closing? ch)
-          (do
-            (when (or (empty? stack) (not= ch (peek stack)))
-              (reject! "EDN collection delimiters do not match" {}))
-            (recur (inc index) (pop stack) 0 false false false false forms))
+             ;; inside a collection a token ends at the same characters
+             (if (> tlen 0)
+               (if (separator-code? c) true (if (closing-code? c) true (if (opening-code? c) true (if (= c 59) true (if (= c 34) true (= c 35))))))
+               false)
+             (recur i stack (bump counts) 0 false false false start spans (vector-conj (vector-conj toks tstart) i) -1)
 
-          (separator? ch)
-          (recur (inc index) stack 0 false false false false forms)
+             (= c 59) (recur (+ i w) stack counts 0 false false true start spans toks -1)
 
-          :else
-          (let [next-length (if token? (inc token-length) 1)]
-            (when (> next-length max-token-chars)
-              (reject! "EDN token exceeds limit" {:limit max-token-chars}))
-            (recur (inc index) stack next-length true false false false
-                   (if (and (zero? depth) (not token?)) (inc forms) forms)))))))))
+             (= c 34) (recur (+ i w) stack counts 0 true false false (if (= depth 0) i start) spans toks -1)
 
-(defn- validate-shape! [value]
-  (let [nodes (volatile! 0)]
-    (letfn [(walk [x depth]
-              (when (> depth max-depth)
-                (reject! "EDN value nesting exceeds limit" {:limit max-depth}))
-              (when (> (vswap! nodes inc) max-nodes)
-                (reject! "EDN value contains too many nodes" {:limit max-nodes}))
-              (when (and (string? x) (> (count x) max-string-chars))
-                (reject! "EDN string exceeds limit" {:limit max-string-chars}))
-              (cond
-                (map? x) (doseq [[k v] x]
-                           (walk k (inc depth))
-                           (walk v (inc depth)))
-                (coll? x) (doseq [item x] (walk item (inc depth)))))]
-      (walk value 0)
-      value)))
+             (= c 35)
+             (if (= (ch-at text (+ i 1)) 123)
+               (if (>= (+ depth 1) 128)
+                 (throw (ex-info "EDN nesting exceeds limit" {:phase :decode :limit 128}))
+                 (recur (+ i 2) (vector-conj stack 126) (vector-conj counts 0) 0 false false false (if (= depth 0) i start) spans toks -1))
+               (throw (ex-info "EDN dispatch forms are forbidden" {:phase :decode})))
+
+             (opening-code? c)
+             (if (> (+ depth 1) 128)
+               (throw (ex-info "EDN nesting exceeds limit" {:phase :decode :limit 128}))
+               (recur (+ i w) (vector-conj stack (matching-close-code c)) (vector-conj counts 0) 0 false false false (if (= depth 0) i start) spans toks -1))
+
+             ;; a set closes with `}` too; it is on the stack as 126
+             (closing-code? c)
+             (if (if (= depth 0) true (not (= (if (= (top-of stack) 126) 125 (top-of stack)) c)))
+               (throw (ex-info "EDN collection delimiters do not match" {:phase :decode :index i}))
+               (if (if (= (top-of stack) 125) (odd-map-close? c counts) false)
+                 (throw (ex-info "EDN map has an odd number of forms" {:phase :decode :count (top-of counts)}))
+                 (if (= depth 1)
+                   (recur (+ i w) (pop-stack stack) (pop-stack counts) 0 false false false -1 (vector-conj (vector-conj spans start) (+ i w)) toks -1)
+                   (recur (+ i w) (pop-stack stack) (bump (pop-stack counts)) 0 false false false start spans toks -1))))
+
+             (separator-code? c) (recur (+ i w) stack counts 0 false false false start spans toks -1)
+
+             :else
+             (let [nl (+ tlen 1)]
+               (if (> nl 4096)
+                 (throw (ex-info "EDN token exceeds limit" {:phase :decode :limit 4096}))
+                 (recur (+ i w) stack counts nl false false false
+                        (if (if (= depth 0) (= start -1) false) i start) spans toks (if (= tlen 0) i tstart))))))))))
+
+#?(:kotoba
+   (defn- ch-at [s :string i :i64] :i64
+     (if (if (>= i 0) (< i (string-byte-length s)) false) (string-code-point-at s i) -1)))
+
+#?(:kotoba
+   (defn- dvec [v :vector-i64] :document
+     (loop [i 0 d (document-vector)]
+       (if (>= i (vector-count v)) d (recur (+ i 1) (document-vector-conj d (document-i64 (vector-at v i))))))))
+
+#?(:kotoba
+   (defn- delem [d :document i :i64] :document
+     (if (= (document-kind d) :list)
+       (option-or (document-list-at d i) (document-null))
+       (option-or (document-vector-at d i) (document-null)))))
+
+#?(:kotoba
+   (defn- dnum [d :document i :i64] :i64
+     (option-or (document-i64-value (delem d i)) 0)))
+
+#?(:kotoba
+   (defn- digit-code? [c :i64] :bool (if (>= c 48) (<= c 57) false)))
+
+#?(:kotoba
+   (defn- digits-end [t :string i0 :i64 n :i64] :i64
+     (loop [i i0] (if (if (< i n) (digit-code? (string-code-point-at t i)) false) (recur (+ i 1)) i))))
+
+#?(:kotoba
+   ;; |value| of an integer token that fits an i64 (16 digits always do)
+   (defn- parsed-abs [t :string] :i64
+     (let [v (result-value-of [:result :i64 :keyword] (string-parse-i64 t) 0)]
+       (if (< v 0) (- 0 v) v))))
+
+#?(:kotoba
+   ;; how a bare token reads: 0 ordinary, 1 refused number, 2 malformed number,
+   ;; 3 empty keyword, 4 auto-resolved keyword, 5 character literal
+   (defn- token-verdict [t :string] :i64
+     (let [n (string-byte-length t)
+           c0 (string-code-point-at t 0)]
+       (cond
+         (= c0 92) 5
+         (= c0 58) (if (= n 1) 3 (if (= (string-code-point-at t 1) 58) 4 0))
+         (if (digit-code? c0) true (if (if (= c0 43) true (= c0 45)) (if (> n 1) (digit-code? (string-code-point-at t 1)) false) false))
+         (let [s (if (digit-code? c0) 0 1)
+               d1 (digits-end t s n)
+               last (string-code-point-at t (- n 1))]
+           (cond
+             (if (= d1 n) true false)
+             (if (> (- n s) 16) 1 (if (> (parsed-abs t) 9007199254740991) 1 0))
+             (if (= d1 s) true false) 2
+             (if (= d1 (- n 1)) (if (= last 78) true (= last 77)) false) 1
+             (= (string-code-point-at t d1) 47) 1
+             (float-shape? t d1 n) 0
+             (= last 77) 1
+             :else 2))
+         :else 0))))
+
+#?(:kotoba
+   ;; the rest of a float after its integer part, from offset d1: (.digits*)?([eE][+-]?digits+)?
+   (defn- float-shape? [t :string d1 :i64 n :i64] :bool
+     (let [c (string-code-point-at t d1)
+           i1 (if (= c 46) (digits-end t (+ d1 1) n) d1)
+           e (if (< i1 n) (string-code-point-at t i1) -1)]
+       (if (= i1 n)
+         (if (= c 46) true false)
+         (if (if (= e 101) true (= e 69))
+           (let [j (if (< (+ i1 1) n) (if (if (= (string-code-point-at t (+ i1 1)) 43) true (= (string-code-point-at t (+ i1 1)) 45)) (+ i1 2) (+ i1 1)) (+ i1 1))]
+             (if (< j n) (= (digits-end t j n) n) false))
+           false)))))
+
+#?(:kotoba
+   (defn- check-token [text :string a :i64 b :i64] :i64
+     (let [t (string-substring text a b)
+           v (token-verdict t)]
+       (cond
+         (= v 1) (throw (ex-info (string-concat "EDN number would not mean the same on every host: " t) {:phase :decode :token t}))
+         (= v 2) (throw (ex-info "EDN number is malformed" {:phase :decode :token t}))
+         (= v 3) (throw (ex-info "EDN keyword is empty" {:phase :decode}))
+         (= v 4) (throw (ex-info "EDN auto-resolved keywords are forbidden" {:phase :decode :token t}))
+         (= v 5) (throw (ex-info "EDN character literals are not read on this route" {:phase :decode :token t}))
+         :else 0))))
+
+#?(:kotoba
+   (defn- check-tokens [text :string toks :document k :i64] :i64
+     (if (>= (* 2 k) (document-count toks))
+       0
+       (let [ok (check-token text (dnum toks (* 2 k)) (dnum toks (+ 1 (* 2 k))))]
+         (check-tokens text toks (+ k 1))))))
+
+#?(:kotoba
+   (defn- string-too-long? [d :document] :bool
+     (if (= (document-kind d) :string)
+       (> (string-byte-length (option-or (document-string-value d) "")) 1048576)
+       false)))
+
+#?(:kotoba
+   ;; node count after walking `x`, or -1 past the depth bound, -2 past the node
+   ;; bound, -3 for a string past its bound (nothing here aborts; `validated` does)
+   (defn- walk [x :document depth :i64 nodes :i64] :i64
+     (if (> depth 128)
+       -1
+       (if (> (+ nodes 1) 200000)
+         -2
+         (if (string-too-long? x)
+           -3
+           (let [kind (document-kind x)]
+             (cond
+               (= kind :map) (walk-entries x 0 (+ depth 1) (+ nodes 1))
+               (= kind :vector) (walk-elems x 0 (+ depth 1) (+ nodes 1))
+               (= kind :list) (walk-elems x 0 (+ depth 1) (+ nodes 1))
+               ;; a set's elements cannot be indexed: it counts as its size
+               (= kind :set) (+ nodes (+ 1 (document-count x)))
+               :else (+ nodes 1))))))))
+
+#?(:kotoba
+   (defn- walk-elems [x :document i :i64 depth :i64 nodes :i64] :i64
+     (if (>= i (document-count x))
+       nodes
+       (let [n2 (walk (delem x i) depth nodes)]
+         (if (< n2 0) n2 (walk-elems x (+ i 1) depth n2))))))
+
+#?(:kotoba
+   (defn- walk-entries [x :document i :i64 depth :i64 nodes :i64] :i64
+     (if (>= i (document-count x))
+       nodes
+       (let [e (option-or (document-map-entry-at x i) (document-null))
+             n1 (walk (delem e 0) depth nodes)
+             n2 (if (< n1 0) n1 (walk (delem e 1) depth n1))]
+         (if (< n2 0) n2 (walk-entries x (+ i 1) depth n2))))))
+
+#?(:kotoba
+   (defn- validated [v :document] :document
+     (let [n (walk v 0 0)]
+       (cond
+         (= n -1) (throw (ex-info "EDN value nesting exceeds limit" {:phase :decode :limit 128}))
+         (= n -2) (throw (ex-info "EDN value contains too many nodes" {:phase :decode :limit 200000}))
+         (= n -3) (throw (ex-info "EDN string exceeds limit" {:phase :decode :limit 1048576}))
+         :else v))))
+
+#?(:kotoba
+   (defn- read-span [text :string a :i64 b :i64] :document
+     (validated (document-edn-read (string-substring text a b)))))
+
+#?(:kotoba
+   (defn- scan [text :string] :document
+     (if (> (string-byte-length text) 8388608)
+       (throw (ex-info "EDN input exceeds byte limit" {:phase :decode :limit 8388608}))
+       (let [r (scan-loop text (string-byte-length text))
+             toks (delem r 1)
+             ok (check-tokens text toks 0)]
+         (delem r 0)))))
+
+#?(:kotoba
+   (defn read-document [text :string] :document
+     (let [spans (scan text)
+           k (quot (document-count spans) 2)]
+       (cond
+         (= k 0) (throw (ex-info "EDN input is empty" {:phase :decode}))
+         (> k 1) (throw (ex-info "EDN input contains trailing forms" {:phase :decode}))
+         :else (read-span text (dnum spans 0) (dnum spans 1))))))
+
+#?(:kotoba
+   (defn- read-spans [text :string spans :document k :i64 n :i64 out :document] :document
+     (if (>= k n)
+       out
+       (let [v (read-span text (dnum spans (* 2 k)) (dnum spans (+ 1 (* 2 k))))]
+         (read-spans text spans (+ k 1) n (document-vector-conj out v))))))
+
+#?(:kotoba
+   (defn read-all [text :string] :document
+     (let [spans (scan text)]
+       (read-spans text spans 0 (quot (document-count spans) 2) (document-vector)))))
+
+#?(:kotoba
+   (defn escape-controls [text :string] :string
+     (let [n (string-byte-length text)]
+       (loop [i 0 out ""]
+         (if (>= i n)
+           out
+           (let [c (string-code-point-at text i)
+                 w (utf8-width c)]
+             (recur (+ i w)
+                    (string-concat
+                     out
+                     (if (if (if (< c 32) true (= c 127)) (if (= c 9) false (if (= c 10) false (not (= c 13)))) false)
+                       (string-concat "\\u" (string-concat "00" (string-concat (hex-digit (bit-and (i64-shift-right c 4) 15)) (hex-digit (bit-and c 15)))))
+                       (string-substring text i (+ i w)))))))))))
+
+#?(:kotoba
+   (defn write-string [value :document] :string
+     (let [v (validated value)
+           text (escape-controls (document-edn-print v))]
+       (if (> (string-byte-length text) 8388608)
+         (throw (ex-info "EDN output exceeds byte limit" {:phase :decode :limit 8388608}))
+         text))))
+
+#?(:kotoba
+   (defn- hex-digit [n :i64] :string
+     (string-substring "0123456789abcdef" n (+ n 1))))
+
+#?(:clj
+   (def max-edn-bytes (* 8 1024 1024))
+   :cljs
+   (def max-edn-bytes (* 8 1024 1024)))
+#?(:clj
+   (def max-depth 128)
+   :cljs
+   (def max-depth 128))
+#?(:clj
+   (def max-token-chars 4096)
+   :cljs
+   (def max-token-chars 4096))
+#?(:clj
+   (def max-nodes 200000)
+   :cljs
+   (def max-nodes 200000))
+#?(:clj
+   (def max-string-chars (* 1024 1024))
+   :cljs
+   (def max-string-chars (* 1024 1024)))
+
+#?(:clj
+   (defn- reject! [message data]
+     (throw (ex-info message (merge {:phase :decode} data))))
+   :cljs
+   (defn- reject! [message data]
+     (throw (ex-info message (merge {:phase :decode} data)))))
+
+#?(:clj
+   (defn- utf8-size [text]
+     #?(:clj (alength (kbytes/utf8-bytes ^String text))
+        :cljs (.-length (.encode (js/TextEncoder.) text))))
+   :cljs
+   (defn- utf8-size [text]
+     #?(:clj (alength (kbytes/utf8-bytes ^String text))
+        :cljs (.-length (.encode (js/TextEncoder.) text)))))
+
+#?(:clj
+   (defn- opening? [ch]
+     (or (= ch "(") (= ch "[") (= ch "{")))
+   :cljs
+   (defn- opening? [ch]
+     (or (= ch "(") (= ch "[") (= ch "{"))))
+
+#?(:clj
+   (defn- closing? [ch]
+     (or (= ch ")") (= ch "]") (= ch "}")))
+   :cljs
+   (defn- closing? [ch]
+     (or (= ch ")") (= ch "]") (= ch "}"))))
+
+#?(:clj
+   (defn- matching-close [ch]
+     (case ch "(" ")" "[" "]" "{" "}"))
+   :cljs
+   (defn- matching-close [ch]
+     (case ch "(" ")" "[" "]" "{" "}")))
+
+#?(:clj
+   (defn- separator? [ch]
+     (or (= ch ",") (= ch " ") (= ch "\t")
+         (= ch "\n") (= ch "\r")))
+   :cljs
+   (defn- separator? [ch]
+     (or (= ch ",") (= ch " ") (= ch "\t")
+         (= ch "\n") (= ch "\r"))))
+
+#?(:clj
+   (defn- preflight!
+     "Bound and syntax-check `text` before any value is built. `allow-tags?` is
+     false unless the caller supplied a `:readers` or `:default` option: a tagged
+     literal is admitted by the LEXER only when someone has said what to do with
+     it, so the strict default cannot be widened by accident."
+     ([text] (preflight! text false))
+     ([text allow-tags?]
+     (loop [index 0 stack [] token-length 0 token? false
+            in-string? false escaped? false in-comment? false forms 0]
+       (if (>= index (count text))
+         (do
+           (when in-string? (reject! "EDN string is unterminated" {}))
+           (when (seq stack) (reject! "EDN collection is unterminated" {}))
+           (when (zero? forms) (reject! "EDN input is empty" {}))
+           (when (> forms 1) (reject! "EDN input contains trailing forms" {}))
+           text)
+         (let [ch (.charAt text index)
+               depth (count stack)]
+           (cond
+             in-comment?
+             (recur (inc index) stack 0 false false false
+                    (not= ch "\n") forms)
+   
+             (and in-string? escaped?)
+             (recur (inc index) stack 0 false true false false forms)
+   
+             (and in-string? (= ch "\\"))
+             (recur (inc index) stack 0 false true true false forms)
+   
+             in-string?
+             (recur (inc index) stack 0 false (not= ch "\"") false false forms)
+   
+             (= ch ";")
+             (recur (inc index) stack 0 false false false true forms)
+   
+             (= ch "\"")
+             (recur (inc index) stack 0 false true false false
+                    (if (zero? depth) (inc forms) forms))
+   
+             (= ch "#")
+             ;; Two dispatch forms are admitted and no others: `#{` (a set) and
+             ;; `#:ns{` (a namespaced map). Both are pure data shapes -- neither
+             ;; names a reader, so neither can run anything. Every other `#` is
+             ;; still refused, tagged literals included.
+             (let [nxt (when (< (inc index) (count text)) (.charAt text (inc index)))
+                   ;; for `#:ns{`, walk the namespace token to the brace
+                   ns-end (when (= nxt ":")
+                            (loop [j (+ index 2)]
+                              (cond
+                                (>= j (count text)) nil
+                                (= (.charAt text j) "{") j
+                                (or (separator? (.charAt text j))
+                                    (opening? (.charAt text j))
+                                    (closing? (.charAt text j))) nil
+                                :else (recur (inc j)))))
+                   brace-at (cond (= nxt "{") (inc index)
+                                  ns-end     ns-end)]
+               (cond
+                 brace-at
+                 (let [next-stack (conj stack "}")]
+                   (when (> (count next-stack) max-depth)
+                     (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+                   (recur (inc brace-at) next-stack 0 false false false false
+                          (if (zero? depth) (inc forms) forms)))
+   
+                 ;; `#tag value` -- skip the TAG token here and let the value that
+                 ;; follows be lexed and counted normally, so `#inst "x"` is one
+                 ;; top-level form and `#inst "x" #inst "y"` is still two (and so
+                 ;; still refused as trailing).
+                 (and allow-tags? nxt (not (separator? nxt))
+                      (not (opening? nxt)) (not (closing? nxt)))
+                 (recur (loop [j (inc index)]
+                          (if (or (>= j (count text))
+                                  (separator? (.charAt text j))
+                                  (opening? (.charAt text j))
+                                  (closing? (.charAt text j)))
+                            j
+                            (recur (inc j))))
+                        stack 0 false false false false forms)
+   
+                 :else (reject! "EDN dispatch forms are forbidden" {})))
+   
+             (opening? ch)
+             (let [next-stack (conj stack (matching-close ch))]
+               (when (> (count next-stack) max-depth)
+                 (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+               (recur (inc index) next-stack 0 false false false false
+                      (if (zero? depth) (inc forms) forms)))
+   
+             (closing? ch)
+             (do
+               (when (or (empty? stack) (not= ch (peek stack)))
+                 (reject! "EDN collection delimiters do not match" {}))
+               (recur (inc index) (pop stack) 0 false false false false forms))
+   
+             (separator? ch)
+             (recur (inc index) stack 0 false false false false forms)
+   
+             :else
+             (let [next-length (if token? (inc token-length) 1)]
+               (when (> next-length max-token-chars)
+                 (reject! "EDN token exceeds limit" {:limit max-token-chars}))
+               (recur (inc index) stack next-length true false false false
+                      (if (and (zero? depth) (not token?)) (inc forms) forms)))))))))
+   :cljs
+   (defn- preflight!
+     "Bound and syntax-check `text` before any value is built. `allow-tags?` is
+     false unless the caller supplied a `:readers` or `:default` option: a tagged
+     literal is admitted by the LEXER only when someone has said what to do with
+     it, so the strict default cannot be widened by accident."
+     ([text] (preflight! text false))
+     ([text allow-tags?]
+     (loop [index 0 stack [] token-length 0 token? false
+            in-string? false escaped? false in-comment? false forms 0]
+       (if (>= index (count text))
+         (do
+           (when in-string? (reject! "EDN string is unterminated" {}))
+           (when (seq stack) (reject! "EDN collection is unterminated" {}))
+           (when (zero? forms) (reject! "EDN input is empty" {}))
+           (when (> forms 1) (reject! "EDN input contains trailing forms" {}))
+           text)
+         (let [ch (.charAt text index)
+               depth (count stack)]
+           (cond
+             in-comment?
+             (recur (inc index) stack 0 false false false
+                    (not= ch "\n") forms)
+   
+             (and in-string? escaped?)
+             (recur (inc index) stack 0 false true false false forms)
+   
+             (and in-string? (= ch "\\"))
+             (recur (inc index) stack 0 false true true false forms)
+   
+             in-string?
+             (recur (inc index) stack 0 false (not= ch "\"") false false forms)
+   
+             (= ch ";")
+             (recur (inc index) stack 0 false false false true forms)
+   
+             (= ch "\"")
+             (recur (inc index) stack 0 false true false false
+                    (if (zero? depth) (inc forms) forms))
+   
+             (= ch "#")
+             ;; Two dispatch forms are admitted and no others: `#{` (a set) and
+             ;; `#:ns{` (a namespaced map). Both are pure data shapes -- neither
+             ;; names a reader, so neither can run anything. Every other `#` is
+             ;; still refused, tagged literals included.
+             (let [nxt (when (< (inc index) (count text)) (.charAt text (inc index)))
+                   ;; for `#:ns{`, walk the namespace token to the brace
+                   ns-end (when (= nxt ":")
+                            (loop [j (+ index 2)]
+                              (cond
+                                (>= j (count text)) nil
+                                (= (.charAt text j) "{") j
+                                (or (separator? (.charAt text j))
+                                    (opening? (.charAt text j))
+                                    (closing? (.charAt text j))) nil
+                                :else (recur (inc j)))))
+                   brace-at (cond (= nxt "{") (inc index)
+                                  ns-end     ns-end)]
+               (cond
+                 brace-at
+                 (let [next-stack (conj stack "}")]
+                   (when (> (count next-stack) max-depth)
+                     (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+                   (recur (inc brace-at) next-stack 0 false false false false
+                          (if (zero? depth) (inc forms) forms)))
+   
+                 ;; `#tag value` -- skip the TAG token here and let the value that
+                 ;; follows be lexed and counted normally, so `#inst "x"` is one
+                 ;; top-level form and `#inst "x" #inst "y"` is still two (and so
+                 ;; still refused as trailing).
+                 (and allow-tags? nxt (not (separator? nxt))
+                      (not (opening? nxt)) (not (closing? nxt)))
+                 (recur (loop [j (inc index)]
+                          (if (or (>= j (count text))
+                                  (separator? (.charAt text j))
+                                  (opening? (.charAt text j))
+                                  (closing? (.charAt text j)))
+                            j
+                            (recur (inc j))))
+                        stack 0 false false false false forms)
+   
+                 :else (reject! "EDN dispatch forms are forbidden" {})))
+   
+             (opening? ch)
+             (let [next-stack (conj stack (matching-close ch))]
+               (when (> (count next-stack) max-depth)
+                 (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+               (recur (inc index) next-stack 0 false false false false
+                      (if (zero? depth) (inc forms) forms)))
+   
+             (closing? ch)
+             (do
+               (when (or (empty? stack) (not= ch (peek stack)))
+                 (reject! "EDN collection delimiters do not match" {}))
+               (recur (inc index) (pop stack) 0 false false false false forms))
+   
+             (separator? ch)
+             (recur (inc index) stack 0 false false false false forms)
+   
+             :else
+             (let [next-length (if token? (inc token-length) 1)]
+               (when (> next-length max-token-chars)
+                 (reject! "EDN token exceeds limit" {:limit max-token-chars}))
+               (recur (inc index) stack next-length true false false false
+                      (if (and (zero? depth) (not token?)) (inc forms) forms))))))))))
+
+#?(:clj
+   (defn- validate-shape! [value]
+     (let [nodes (volatile! 0)]
+       (letfn [(walk [x depth]
+                 (when (> depth max-depth)
+                   (reject! "EDN value nesting exceeds limit" {:limit max-depth}))
+                 (when (> (vswap! nodes inc) max-nodes)
+                   (reject! "EDN value contains too many nodes" {:limit max-nodes}))
+                 (when (and (string? x) (> (count x) max-string-chars))
+                   (reject! "EDN string exceeds limit" {:limit max-string-chars}))
+                 (cond
+                   (map? x) (doseq [[k v] x]
+                              (walk k (inc depth))
+                              (walk v (inc depth)))
+                   (coll? x) (doseq [item x] (walk item (inc depth)))))]
+         (walk value 0)
+         value)))
+   :cljs
+   (defn- validate-shape! [value]
+     (let [nodes (volatile! 0)]
+       (letfn [(walk [x depth]
+                 (when (> depth max-depth)
+                   (reject! "EDN value nesting exceeds limit" {:limit max-depth}))
+                 (when (> (vswap! nodes inc) max-nodes)
+                   (reject! "EDN value contains too many nodes" {:limit max-nodes}))
+                 (when (and (string? x) (> (count x) max-string-chars))
+                   (reject! "EDN string exceeds limit" {:limit max-string-chars}))
+                 (cond
+                   (map? x) (doseq [[k v] x]
+                              (walk k (inc depth))
+                              (walk v (inc depth)))
+                   (coll? x) (doseq [item x] (walk item (inc depth)))))]
+         (walk value 0)
+         value))))
 
 
 ;; ---------------------------------------------------------------------------
@@ -182,463 +725,946 @@
 ;; represent (2^53-1). Beyond it the JVM would be right and the browser would
 ;; be wrong, which is the whole class above.
 
-(def max-exact-integer
-  "Largest integer both hosts represent exactly (2^53 - 1). An integer literal
-  outside +/- this is refused rather than silently rounded on one host."
-  9007199254740991)
+#?(:clj
+   (def max-exact-integer
+     "Largest integer both hosts represent exactly (2^53 - 1). An integer literal
+     outside +/- this is refused rather than silently rounded on one host."
+     9007199254740991)
+   :cljs
+   (def max-exact-integer
+     "Largest integer both hosts represent exactly (2^53 - 1). An integer literal
+     outside +/- this is refused rather than silently rounded on one host."
+     9007199254740991))
 
-(defn- alphanumeric? [ch]
-  (let [c #?(:clj (int ch) :cljs (.charCodeAt (str ch) 0))]
-    (or (<= 48 c 57) (<= 65 c 90) (<= 97 c 122))))
+#?(:clj
+   (defn- alphanumeric? [ch]
+     (let [c #?(:clj (int ch) :cljs (.charCodeAt (str ch) 0))]
+       (or (<= 48 c 57) (<= 65 c 90) (<= 97 c 122))))
+   :cljs
+   (defn- alphanumeric? [ch]
+     (let [c #?(:clj (int ch) :cljs (.charCodeAt (str ch) 0))]
+       (or (<= 48 c 57) (<= 65 c 90) (<= 97 c 122)))))
 
-(defn- hex->int [hex]
-  #?(:clj (Integer/parseInt ^String hex 16) :cljs (js/parseInt hex 16)))
+#?(:clj
+   (defn- hex->int [hex]
+     #?(:clj (Integer/parseInt ^String hex 16) :cljs (js/parseInt hex 16)))
+   :cljs
+   (defn- hex->int [hex]
+     #?(:clj (Integer/parseInt ^String hex 16) :cljs (js/parseInt hex 16))))
 
-(defn- skip-blanks
-  "Index of the next character that begins a value, skipping separators and
-  `;` comments."
-  [text i]
-  (let [n (count text)]
-    (loop [i i]
-      (cond
-        (>= i n) i
-        (separator? (.charAt ^String text i)) (recur (inc i))
-        (= (.charAt ^String text i) ";")
-        (recur (loop [j i]
-                 (if (or (>= j n) (= (.charAt ^String text j) "\n")) j (recur (inc j)))))
-        :else i))))
+#?(:clj
+   (defn- skip-blanks
+     "Index of the next character that begins a value, skipping separators and
+     `;` comments."
+     [text i]
+     (let [n (count text)]
+       (loop [i i]
+         (cond
+           (>= i n) i
+           (separator? (.charAt ^String text i)) (recur (inc i))
+           (= (.charAt ^String text i) ";")
+           (recur (loop [j i]
+                    (if (or (>= j n) (= (.charAt ^String text j) "\n")) j (recur (inc j)))))
+           :else i))))
+   :cljs
+   (defn- skip-blanks
+     "Index of the next character that begins a value, skipping separators and
+     `;` comments."
+     [text i]
+     (let [n (count text)]
+       (loop [i i]
+         (cond
+           (>= i n) i
+           (separator? (.charAt ^String text i)) (recur (inc i))
+           (= (.charAt ^String text i) ";")
+           (recur (loop [j i]
+                    (if (or (>= j n) (= (.charAt ^String text j) "\n")) j (recur (inc j)))))
+           :else i)))))
 
-(defn- read-string-literal
-  "`[value next-index]` for the string starting at the opening quote `i`."
-  [text i]
-  (let [n (count text)]
-    (loop [j (inc i) out []]
-      (when (>= j n) (reject! "EDN string is unterminated" {}))
-      (let [c (.charAt ^String text j)]
-        (cond
-          (= c "\"") [(apply str out) (inc j)]
+#?(:clj
+   (defn- read-string-literal
+     "`[value next-index]` for the string starting at the opening quote `i`."
+     [text i]
+     (let [n (count text)]
+       (loop [j (inc i) out []]
+         (when (>= j n) (reject! "EDN string is unterminated" {}))
+         (let [c (.charAt ^String text j)]
+           (cond
+             (= c "\"") [(apply str out) (inc j)]
+   
+             (= c "\\")
+             (let [e (when (< (inc j) n) (.charAt ^String text (inc j)))]
+               (cond
+                 (= e "\"") (recur (+ j 2) (conj out "\""))
+                 (= e "\\") (recur (+ j 2) (conj out "\\"))
+                 (= e "/") (recur (+ j 2) (conj out "/"))
+                 (= e "b") (recur (+ j 2) (conj out (char 8)))
+                 (= e "f") (recur (+ j 2) (conj out (char 12)))
+                 (= e "n") (recur (+ j 2) (conj out "\n"))
+                 (= e "r") (recur (+ j 2) (conj out "\r"))
+                 (= e "t") (recur (+ j 2) (conj out "\t"))
+                 (= e "u")
+                 (let [hex (when (<= (+ j 6) n) (subs text (+ j 2) (+ j 6)))]
+                   (if (and hex (re-matches #"[0-9a-fA-F]{4}" hex))
+                     (recur (+ j 6) (conj out (char (hex->int hex))))
+                     (reject! "EDN unicode escape is malformed" {})))
+                 :else (reject! "EDN string escape is not recognised"
+                                {:escape (str e)})))
+   
+             :else (recur (inc j) (conj out c)))))))
+   :cljs
+   (defn- read-string-literal
+     "`[value next-index]` for the string starting at the opening quote `i`."
+     [text i]
+     (let [n (count text)]
+       (loop [j (inc i) out []]
+         (when (>= j n) (reject! "EDN string is unterminated" {}))
+         (let [c (.charAt ^String text j)]
+           (cond
+             (= c "\"") [(apply str out) (inc j)]
+   
+             (= c "\\")
+             (let [e (when (< (inc j) n) (.charAt ^String text (inc j)))]
+               (cond
+                 (= e "\"") (recur (+ j 2) (conj out "\""))
+                 (= e "\\") (recur (+ j 2) (conj out "\\"))
+                 (= e "/") (recur (+ j 2) (conj out "/"))
+                 (= e "b") (recur (+ j 2) (conj out (char 8)))
+                 (= e "f") (recur (+ j 2) (conj out (char 12)))
+                 (= e "n") (recur (+ j 2) (conj out "\n"))
+                 (= e "r") (recur (+ j 2) (conj out "\r"))
+                 (= e "t") (recur (+ j 2) (conj out "\t"))
+                 (= e "u")
+                 (let [hex (when (<= (+ j 6) n) (subs text (+ j 2) (+ j 6)))]
+                   (if (and hex (re-matches #"[0-9a-fA-F]{4}" hex))
+                     (recur (+ j 6) (conj out (char (hex->int hex))))
+                     (reject! "EDN unicode escape is malformed" {})))
+                 :else (reject! "EDN string escape is not recognised"
+                                {:escape (str e)})))
+   
+             :else (recur (inc j) (conj out c))))))))
 
-          (= c "\\")
-          (let [e (when (< (inc j) n) (.charAt ^String text (inc j)))]
-            (cond
-              (= e "\"") (recur (+ j 2) (conj out "\""))
-              (= e "\\") (recur (+ j 2) (conj out "\\"))
-              (= e "/") (recur (+ j 2) (conj out "/"))
-              (= e "b") (recur (+ j 2) (conj out (char 8)))
-              (= e "f") (recur (+ j 2) (conj out (char 12)))
-              (= e "n") (recur (+ j 2) (conj out "\n"))
-              (= e "r") (recur (+ j 2) (conj out "\r"))
-              (= e "t") (recur (+ j 2) (conj out "\t"))
-              (= e "u")
-              (let [hex (when (<= (+ j 6) n) (subs text (+ j 2) (+ j 6)))]
-                (if (and hex (re-matches #"[0-9a-fA-F]{4}" hex))
-                  (recur (+ j 6) (conj out (char (hex->int hex))))
-                  (reject! "EDN unicode escape is malformed" {})))
-              :else (reject! "EDN string escape is not recognised"
-                             {:escape (str e)})))
+#?(:clj
+   (def ^:private named-chars
+     {"newline" "\n" "space" " " "tab" "\t" "return" "\r"
+      "backspace" (char 8) "formfeed" (char 12)})
+   :cljs
+   (def ^:private named-chars
+     {"newline" "\n" "space" " " "tab" "\t" "return" "\r"
+      "backspace" (char 8) "formfeed" (char 12)}))
 
-          :else (recur (inc j) (conj out c)))))))
+#?(:clj
+   (defn- read-char-literal
+     "`[value next-index]` for the character literal starting at the backslash `i`.
+     The character immediately after the backslash is always literal (so a closing
+     paren and a semicolon both read as characters), then a name continues while
+     alphanumeric."
+     [text i]
+     (let [n (count text)]
+       (when (>= (inc i) n) (reject! "EDN character literal is empty" {}))
+       (let [j   (loop [j (+ i 2)]
+                   (if (and (< j n) (alphanumeric? (.charAt ^String text j)))
+                     (recur (inc j)) j))
+             tok (subs text (inc i) j)]
+         (cond
+           (= 1 (count tok)) [(.charAt ^String tok 0) j]
+           (contains? named-chars tok) [(get named-chars tok) j]
+           (re-matches #"u[0-9a-fA-F]{4}" tok) [(char (hex->int (subs tok 1))) j]
+           :else (reject! "EDN character literal is not recognised" {:literal tok})))))
+   :cljs
+   (defn- read-char-literal
+     "`[value next-index]` for the character literal starting at the backslash `i`.
+     The character immediately after the backslash is always literal (so a closing
+     paren and a semicolon both read as characters), then a name continues while
+     alphanumeric."
+     [text i]
+     (let [n (count text)]
+       (when (>= (inc i) n) (reject! "EDN character literal is empty" {}))
+       (let [j   (loop [j (+ i 2)]
+                   (if (and (< j n) (alphanumeric? (.charAt ^String text j)))
+                     (recur (inc j)) j))
+             tok (subs text (inc i) j)]
+         (cond
+           (= 1 (count tok)) [(.charAt ^String tok 0) j]
+           (contains? named-chars tok) [(get named-chars tok) j]
+           (re-matches #"u[0-9a-fA-F]{4}" tok) [(char (hex->int (subs tok 1))) j]
+           :else (reject! "EDN character literal is not recognised" {:literal tok}))))))
 
-(def ^:private named-chars
-  {"newline" "\n" "space" " " "tab" "\t" "return" "\r"
-   "backspace" (char 8) "formfeed" (char 12)})
+#?(:clj
+   (defn- token-end
+     "Index one past the bare token starting at `i`."
+     [text i]
+     (let [n (count text)]
+       (loop [j i]
+         (if (or (>= j n)
+                 (separator? (.charAt ^String text j))
+                 (opening? (.charAt ^String text j))
+                 (closing? (.charAt ^String text j))
+                 (= (.charAt ^String text j) "\"")
+                 (= (.charAt ^String text j) ";"))
+           j
+           (recur (inc j))))))
+   :cljs
+   (defn- token-end
+     "Index one past the bare token starting at `i`."
+     [text i]
+     (let [n (count text)]
+       (loop [j i]
+         (if (or (>= j n)
+                 (separator? (.charAt ^String text j))
+                 (opening? (.charAt ^String text j))
+                 (closing? (.charAt ^String text j))
+                 (= (.charAt ^String text j) "\"")
+                 (= (.charAt ^String text j) ";"))
+           j
+           (recur (inc j)))))))
 
-(defn- read-char-literal
-  "`[value next-index]` for the character literal starting at the backslash `i`.
-  The character immediately after the backslash is always literal (so a closing
-  paren and a semicolon both read as characters), then a name continues while
-  alphanumeric."
-  [text i]
-  (let [n (count text)]
-    (when (>= (inc i) n) (reject! "EDN character literal is empty" {}))
-    (let [j   (loop [j (+ i 2)]
-                (if (and (< j n) (alphanumeric? (.charAt ^String text j)))
-                  (recur (inc j)) j))
-          tok (subs text (inc i) j)]
-      (cond
-        (= 1 (count tok)) [(.charAt ^String tok 0) j]
-        (contains? named-chars tok) [(get named-chars tok) j]
-        (re-matches #"u[0-9a-fA-F]{4}" tok) [(char (hex->int (subs tok 1))) j]
-        :else (reject! "EDN character literal is not recognised" {:literal tok})))))
+#?(:clj
+   (defn- refuse-imprecise! [tok kind]
+     (reject! (str "EDN number would not mean the same on every host: " tok)
+              {:kotoba.lang.edn/reason kind :token tok}))
+   :cljs
+   (defn- refuse-imprecise! [tok kind]
+     (reject! (str "EDN number would not mean the same on every host: " tok)
+              {:kotoba.lang.edn/reason kind :token tok})))
 
-(defn- token-end
-  "Index one past the bare token starting at `i`."
-  [text i]
-  (let [n (count text)]
-    (loop [j i]
-      (if (or (>= j n)
-              (separator? (.charAt ^String text j))
-              (opening? (.charAt ^String text j))
-              (closing? (.charAt ^String text j))
-              (= (.charAt ^String text j) "\"")
-              (= (.charAt ^String text j) ";"))
-        j
-        (recur (inc j))))))
+#?(:clj
+   (defn- parse-number [tok]
+     (cond
+       ;; the four host-divergent forms, refused rather than rounded
+       (re-matches #"[+-]?[0-9]+N" tok)                       (refuse-imprecise! tok :number/bigint-suffix)
+       (re-matches #"[+-]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?M" tok) (refuse-imprecise! tok :number/bigdec-suffix)
+       (re-matches #"[+-]?[0-9]+/[0-9]+" tok)                 (refuse-imprecise! tok :number/ratio)
+   
+       (re-matches #"[+-]?[0-9]+" tok)
+       (let [magnitude (if (or (= "+" (.charAt ^String tok 0)) (= "-" (.charAt ^String tok 0)))
+                         (subs tok 1) tok)]
+         ;; length first: a 400-digit literal must not be converted before it is
+         ;; range-checked, or the conversion itself is the thing that loses it
+         (when (> (count magnitude) 16) (refuse-imprecise! tok :number/integer-range))
+         (let [v #?(:clj (Long/parseLong ^String tok) :cljs (js/parseInt tok 10))]
+           (when (> (abs v) max-exact-integer) (refuse-imprecise! tok :number/integer-range))
+           v))
+   
+       ;; no leading-dot alternative: `.5` never reaches here, it is a symbol
+       (re-matches #"[+-]?([0-9]+\.[0-9]*|[0-9]+)([eE][+-]?[0-9]+)?" tok)
+       #?(:clj (Double/parseDouble ^String tok) :cljs (js/parseFloat tok))
+   
+       :else (reject! "EDN number is malformed" {:token tok})))
+   :cljs
+   (defn- parse-number [tok]
+     (cond
+       ;; the four host-divergent forms, refused rather than rounded
+       (re-matches #"[+-]?[0-9]+N" tok)                       (refuse-imprecise! tok :number/bigint-suffix)
+       (re-matches #"[+-]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?M" tok) (refuse-imprecise! tok :number/bigdec-suffix)
+       (re-matches #"[+-]?[0-9]+/[0-9]+" tok)                 (refuse-imprecise! tok :number/ratio)
+   
+       (re-matches #"[+-]?[0-9]+" tok)
+       (let [magnitude (if (or (= "+" (.charAt ^String tok 0)) (= "-" (.charAt ^String tok 0)))
+                         (subs tok 1) tok)]
+         ;; length first: a 400-digit literal must not be converted before it is
+         ;; range-checked, or the conversion itself is the thing that loses it
+         (when (> (count magnitude) 16) (refuse-imprecise! tok :number/integer-range))
+         (let [v #?(:clj (Long/parseLong ^String tok) :cljs (js/parseInt tok 10))]
+           (when (> (abs v) max-exact-integer) (refuse-imprecise! tok :number/integer-range))
+           v))
+   
+       ;; no leading-dot alternative: `.5` never reaches here, it is a symbol
+       (re-matches #"[+-]?([0-9]+\.[0-9]*|[0-9]+)([eE][+-]?[0-9]+)?" tok)
+       #?(:clj (Double/parseDouble ^String tok) :cljs (js/parseFloat tok))
+   
+       :else (reject! "EDN number is malformed" {:token tok}))))
 
-(defn- refuse-imprecise! [tok kind]
-  (reject! (str "EDN number would not mean the same on every host: " tok)
-           {:kotoba.lang.edn/reason kind :token tok}))
+#?(:clj
+   (defn- parse-atom [tok]
+     (cond
+       (= tok "nil")   nil
+       (= tok "true")  true
+       (= tok "false") false
+   
+       (= (.charAt ^String tok 0) ":")
+       (cond
+         (= tok ":")                  (reject! "EDN keyword is empty" {})
+         (= (subs tok 0 (min 2 (count tok))) "::")
+         (reject! "EDN auto-resolved keywords are forbidden" {:token tok})
+         :else (keyword (subs tok 1)))
+   
+       ;; A number starts with a DIGIT, optionally signed. A leading dot does
+       ;; not: `.`, `.5`, `-.5`, `...` and `.x` are all symbols to clojure.edn,
+       ;; and routing them to the number parser made this reader refuse
+       ;; `guest-grammar.edn` and `surface-status.edn` -- two of the workspace's
+       ;; own resource files, whose grammars use a bare `.` as a symbol.
+       (re-matches #"[+-]?[0-9].*" tok) (parse-number tok)
+   
+       :else (symbol tok)))
+   :cljs
+   (defn- parse-atom [tok]
+     (cond
+       (= tok "nil")   nil
+       (= tok "true")  true
+       (= tok "false") false
+   
+       (= (.charAt ^String tok 0) ":")
+       (cond
+         (= tok ":")                  (reject! "EDN keyword is empty" {})
+         (= (subs tok 0 (min 2 (count tok))) "::")
+         (reject! "EDN auto-resolved keywords are forbidden" {:token tok})
+         :else (keyword (subs tok 1)))
+   
+       ;; A number starts with a DIGIT, optionally signed. A leading dot does
+       ;; not: `.`, `.5`, `-.5`, `...` and `.x` are all symbols to clojure.edn,
+       ;; and routing them to the number parser made this reader refuse
+       ;; `guest-grammar.edn` and `surface-status.edn` -- two of the workspace's
+       ;; own resource files, whose grammars use a bare `.` as a symbol.
+       (re-matches #"[+-]?[0-9].*" tok) (parse-number tok)
+   
+       :else (symbol tok))))
 
-(defn- parse-number [tok]
-  (cond
-    ;; the four host-divergent forms, refused rather than rounded
-    (re-matches #"[+-]?[0-9]+N" tok)                       (refuse-imprecise! tok :number/bigint-suffix)
-    (re-matches #"[+-]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?M" tok) (refuse-imprecise! tok :number/bigdec-suffix)
-    (re-matches #"[+-]?[0-9]+/[0-9]+" tok)                 (refuse-imprecise! tok :number/ratio)
+#?(:clj
+   (defn- qualify-map
+     "Apply a `#:ns{...}` prefix to a map's keys, as clojure.edn does: an
+     UNQUALIFIED keyword or symbol key gains the namespace, a key that already has
+     one keeps it, and any other key type is left alone.
+   
+     This form is admitted, unlike every other `#` dispatch, because it names no
+     reader -- it is a shorthand for qualification and cannot run anything. Three
+     of this workspace's own resource files use it, so refusing it meant they
+     could never be read by this namespace at all."
+     [ns m]
+     (when (= ns "_") (reject! "EDN namespaced map with _ namespace is forbidden" {}))
+     (reduce-kv
+      (fn [out k v]
+        (assoc out
+               (cond
+                 (and (keyword? k) (nil? (namespace k))) (keyword ns (name k))
+                 (and (symbol? k) (nil? (namespace k)))  (symbol ns (name k))
+                 :else k)
+               v))
+      (empty m) m))
+   :cljs
+   (defn- qualify-map
+     "Apply a `#:ns{...}` prefix to a map's keys, as clojure.edn does: an
+     UNQUALIFIED keyword or symbol key gains the namespace, a key that already has
+     one keeps it, and any other key type is left alone.
+   
+     This form is admitted, unlike every other `#` dispatch, because it names no
+     reader -- it is a shorthand for qualification and cannot run anything. Three
+     of this workspace's own resource files use it, so refusing it meant they
+     could never be read by this namespace at all."
+     [ns m]
+     (when (= ns "_") (reject! "EDN namespaced map with _ namespace is forbidden" {}))
+     (reduce-kv
+      (fn [out k v]
+        (assoc out
+               (cond
+                 (and (keyword? k) (nil? (namespace k))) (keyword ns (name k))
+                 (and (symbol? k) (nil? (namespace k)))  (symbol ns (name k))
+                 :else k)
+               v))
+      (empty m) m)))
 
-    (re-matches #"[+-]?[0-9]+" tok)
-    (let [magnitude (if (or (= "+" (.charAt ^String tok 0)) (= "-" (.charAt ^String tok 0)))
-                      (subs tok 1) tok)]
-      ;; length first: a 400-digit literal must not be converted before it is
-      ;; range-checked, or the conversion itself is the thing that loses it
-      (when (> (count magnitude) 16) (refuse-imprecise! tok :number/integer-range))
-      (let [v #?(:clj (Long/parseLong ^String tok) :cljs (js/parseInt tok 10))]
-        (when (> (abs v) max-exact-integer) (refuse-imprecise! tok :number/integer-range))
-        v))
+#?(:clj
+   (declare read-form)
+   :cljs
+   (declare read-form))
 
-    ;; no leading-dot alternative: `.5` never reaches here, it is a symbol
-    (re-matches #"[+-]?([0-9]+\.[0-9]*|[0-9]+)([eE][+-]?[0-9]+)?" tok)
-    #?(:clj (Double/parseDouble ^String tok) :cljs (js/parseFloat tok))
+#?(:clj
+   (defn- read-sequence
+     "Read forms until `close`, returning `[items next-index]`."
+     [text i close opts]
+     (let [n (count text)]
+       (loop [i i items []]
+         (let [i (skip-blanks text i)]
+           (when (>= i n) (reject! "EDN collection is unterminated" {}))
+           (if (= (.charAt ^String text i) close)
+             [items (inc i)]
+             (let [[v i'] (read-form text i opts)]
+               (recur i' (conj items v))))))))
+   :cljs
+   (defn- read-sequence
+     "Read forms until `close`, returning `[items next-index]`."
+     [text i close opts]
+     (let [n (count text)]
+       (loop [i i items []]
+         (let [i (skip-blanks text i)]
+           (when (>= i n) (reject! "EDN collection is unterminated" {}))
+           (if (= (.charAt ^String text i) close)
+             [items (inc i)]
+             (let [[v i'] (read-form text i opts)]
+               (recur i' (conj items v)))))))))
 
-    :else (reject! "EDN number is malformed" {:token tok})))
+#?(:clj
+   (defn- pairs->map
+     "Build the map, small ones as an array-map so SOURCE ORDER SURVIVES.
+   
+     Not cosmetic. Both host readers do this -- `clojure.edn` hands the pairs to
+     `RT/map`, which returns a PersistentArrayMap at eight entries or fewer -- and
+     `write-string` prints a map in iteration order, so a hash-map here makes
+     read->write reorder the keys of every small map. That breaks textual
+     idempotence, which is exactly the property a `--check` gate over generated
+     text depends on: the file would differ from itself on every regeneration.
+   
+     Above eight entries both hosts promote to a hash-map and order is not
+     preserved by anyone, so this matches that too rather than inventing a
+     stronger guarantee than the thing it replaced."
+     [items]
+     (when (odd? (count items))
+       (reject! "EDN map has an odd number of forms" {:count (count items)}))
+     (let [ks (take-nth 2 items)]
+       (when (not= (count ks) (count (set ks)))
+         (reject! "EDN map has a duplicate key" {}))
+       (if (<= (count ks) 8)
+         (apply array-map items)
+         (apply hash-map items))))
+   :cljs
+   (defn- pairs->map
+     "Build the map, small ones as an array-map so SOURCE ORDER SURVIVES.
+   
+     Not cosmetic. Both host readers do this -- `clojure.edn` hands the pairs to
+     `RT/map`, which returns a PersistentArrayMap at eight entries or fewer -- and
+     `write-string` prints a map in iteration order, so a hash-map here makes
+     read->write reorder the keys of every small map. That breaks textual
+     idempotence, which is exactly the property a `--check` gate over generated
+     text depends on: the file would differ from itself on every regeneration.
+   
+     Above eight entries both hosts promote to a hash-map and order is not
+     preserved by anyone, so this matches that too rather than inventing a
+     stronger guarantee than the thing it replaced."
+     [items]
+     (when (odd? (count items))
+       (reject! "EDN map has an odd number of forms" {:count (count items)}))
+     (let [ks (take-nth 2 items)]
+       (when (not= (count ks) (count (set ks)))
+         (reject! "EDN map has a duplicate key" {}))
+       (if (<= (count ks) 8)
+         (apply array-map items)
+         (apply hash-map items)))))
 
-(defn- parse-atom [tok]
-  (cond
-    (= tok "nil")   nil
-    (= tok "true")  true
-    (= tok "false") false
+#?(:clj
+   (defn- items->set [items]
+     (when (not= (count items) (count (set items)))
+       (reject! "EDN set has a duplicate element" {}))
+     (set items))
+   :cljs
+   (defn- items->set [items]
+     (when (not= (count items) (count (set items)))
+       (reject! "EDN set has a duplicate element" {}))
+     (set items)))
 
-    (= (.charAt ^String tok 0) ":")
-    (cond
-      (= tok ":")                  (reject! "EDN keyword is empty" {})
-      (= (subs tok 0 (min 2 (count tok))) "::")
-      (reject! "EDN auto-resolved keywords are forbidden" {:token tok})
-      :else (keyword (subs tok 1)))
+#?(:clj
+   (defn- apply-tag
+     "Dispatch one `#tag value`, following clojure.edn: a `:readers` entry wins,
+     then `:default`, and with neither the tag is refused. The strict default --
+     no options at all -- therefore behaves exactly as it did before options
+     existed."
+     [opts tag value]
+     (if-let [reader (get (:readers opts) tag)]
+       (reader value)
+       (if-let [d (:default opts)]
+         (d tag value)
+         (reject! "EDN tagged literal has no reader" {:tag tag}))))
+   :cljs
+   (defn- apply-tag
+     "Dispatch one `#tag value`, following clojure.edn: a `:readers` entry wins,
+     then `:default`, and with neither the tag is refused. The strict default --
+     no options at all -- therefore behaves exactly as it did before options
+     existed."
+     [opts tag value]
+     (if-let [reader (get (:readers opts) tag)]
+       (reader value)
+       (if-let [d (:default opts)]
+         (d tag value)
+         (reject! "EDN tagged literal has no reader" {:tag tag})))))
 
-    ;; A number starts with a DIGIT, optionally signed. A leading dot does
-    ;; not: `.`, `.5`, `-.5`, `...` and `.x` are all symbols to clojure.edn,
-    ;; and routing them to the number parser made this reader refuse
-    ;; `guest-grammar.edn` and `surface-status.edn` -- two of the workspace's
-    ;; own resource files, whose grammars use a bare `.` as a symbol.
-    (re-matches #"[+-]?[0-9].*" tok) (parse-number tok)
+#?(:clj
+   (defn- read-form
+     "`[value next-index]` for the one form starting at `i` (already past blanks)."
+     [text i opts]
+     (let [n (count text)]
+       (when (>= i n) (reject! "EDN input is empty" {}))
+       (let [c (.charAt ^String text i)]
+         (cond
+           (= c "\"") (read-string-literal text i)
+           (= c "\\") (read-char-literal text i)
+   
+           (= c "#")
+           (cond
+             (and (< (inc i) n) (= (.charAt ^String text (inc i)) "{"))
+             (let [[items i'] (read-sequence text (+ i 2) "}" opts)]
+               [(items->set items) i'])
+   
+             (and (< (inc i) n) (= (.charAt ^String text (inc i)) ":"))
+             (let [brace (loop [j (+ i 2)]
+                           (cond (>= j n) (reject! "EDN namespaced map is unterminated" {})
+                                 (= (.charAt ^String text j) "{") j
+                                 :else (recur (inc j))))
+                   ns    (subs text (+ i 2) brace)
+                   [items i'] (read-sequence text (inc brace) "}" opts)]
+               (when (empty? ns) (reject! "EDN namespaced map has no namespace" {}))
+               [(qualify-map ns (pairs->map items)) i'])
+   
+             ;; `#tag value` -- only reachable when the caller supplied :readers
+             ;; or :default; preflight refuses the form otherwise.
+             (and (< (inc i) n) (or (:readers opts) (:default opts)))
+             (let [tag-end (token-end text (inc i))
+                   tag     (symbol (subs text (inc i) tag-end))
+                   vstart  (skip-blanks text tag-end)]
+               (when (>= vstart n)
+                 (reject! "EDN tagged literal has no value" {:tag tag}))
+               (let [[v i'] (read-form text vstart opts)]
+                 [(apply-tag opts tag v) i']))
+   
+             :else (reject! "EDN dispatch forms are forbidden" {}))
+   
+           (= c "(") (let [[items i'] (read-sequence text (inc i) ")" opts)] [(apply list items) i'])
+           (= c "[") (let [[items i'] (read-sequence text (inc i) "]" opts)] [items i'])
+           (= c "{") (let [[items i'] (read-sequence text (inc i) "}" opts)] [(pairs->map items) i'])
+   
+           (closing? c) (reject! "EDN collection delimiters do not match" {})
+   
+           :else (let [j (token-end text i)]
+                   (when (= j i) (reject! "EDN token is empty" {}))
+                   [(parse-atom (subs text i j)) j])))))
+   :cljs
+   (defn- read-form
+     "`[value next-index]` for the one form starting at `i` (already past blanks)."
+     [text i opts]
+     (let [n (count text)]
+       (when (>= i n) (reject! "EDN input is empty" {}))
+       (let [c (.charAt ^String text i)]
+         (cond
+           (= c "\"") (read-string-literal text i)
+           (= c "\\") (read-char-literal text i)
+   
+           (= c "#")
+           (cond
+             (and (< (inc i) n) (= (.charAt ^String text (inc i)) "{"))
+             (let [[items i'] (read-sequence text (+ i 2) "}" opts)]
+               [(items->set items) i'])
+   
+             (and (< (inc i) n) (= (.charAt ^String text (inc i)) ":"))
+             (let [brace (loop [j (+ i 2)]
+                           (cond (>= j n) (reject! "EDN namespaced map is unterminated" {})
+                                 (= (.charAt ^String text j) "{") j
+                                 :else (recur (inc j))))
+                   ns    (subs text (+ i 2) brace)
+                   [items i'] (read-sequence text (inc brace) "}" opts)]
+               (when (empty? ns) (reject! "EDN namespaced map has no namespace" {}))
+               [(qualify-map ns (pairs->map items)) i'])
+   
+             ;; `#tag value` -- only reachable when the caller supplied :readers
+             ;; or :default; preflight refuses the form otherwise.
+             (and (< (inc i) n) (or (:readers opts) (:default opts)))
+             (let [tag-end (token-end text (inc i))
+                   tag     (symbol (subs text (inc i) tag-end))
+                   vstart  (skip-blanks text tag-end)]
+               (when (>= vstart n)
+                 (reject! "EDN tagged literal has no value" {:tag tag}))
+               (let [[v i'] (read-form text vstart opts)]
+                 [(apply-tag opts tag v) i']))
+   
+             :else (reject! "EDN dispatch forms are forbidden" {}))
+   
+           (= c "(") (let [[items i'] (read-sequence text (inc i) ")" opts)] [(apply list items) i'])
+           (= c "[") (let [[items i'] (read-sequence text (inc i) "]" opts)] [items i'])
+           (= c "{") (let [[items i'] (read-sequence text (inc i) "}" opts)] [(pairs->map items) i'])
+   
+           (closing? c) (reject! "EDN collection delimiters do not match" {})
+   
+           :else (let [j (token-end text i)]
+                   (when (= j i) (reject! "EDN token is empty" {}))
+                   [(parse-atom (subs text i j)) j]))))))
 
-    :else (symbol tok)))
+#?(:clj
+   (defn- read-one
+     "The single top-level form in `text`. `preflight!` has already refused empty
+     input and trailing forms, so anything left over here is this parser
+     disagreeing with that lexer -- which is a defect, not bad input, and says so."
+     [text opts]
+     (let [i        (skip-blanks text 0)
+           [v i']   (read-form text i opts)
+           leftover (skip-blanks text i')]
+       (when (< leftover (count text))
+         (reject! "EDN reader and preflight disagree about where the form ends"
+                  {:kotoba.lang.edn/reason :reader/desync :index leftover}))
+       v))
+   :cljs
+   (defn- read-one
+     "The single top-level form in `text`. `preflight!` has already refused empty
+     input and trailing forms, so anything left over here is this parser
+     disagreeing with that lexer -- which is a defect, not bad input, and says so."
+     [text opts]
+     (let [i        (skip-blanks text 0)
+           [v i']   (read-form text i opts)
+           leftover (skip-blanks text i')]
+       (when (< leftover (count text))
+         (reject! "EDN reader and preflight disagree about where the form ends"
+                  {:kotoba.lang.edn/reason :reader/desync :index leftover}))
+       v)))
 
-(defn- qualify-map
-  "Apply a `#:ns{...}` prefix to a map's keys, as clojure.edn does: an
-  UNQUALIFIED keyword or symbol key gains the namespace, a key that already has
-  one keeps it, and any other key type is left alone.
+#?(:clj
+   (def ^:private option-keys
+     "Every option `read-string`/`read-all` accept. An unknown key is refused
+     rather than ignored: a typo in an option map is silently the strict default,
+     which is the failure this namespace spends its whole design avoiding."
+     #{:readers :default :eof})
+   :cljs
+   (def ^:private option-keys
+     "Every option `read-string`/`read-all` accept. An unknown key is refused
+     rather than ignored: a typo in an option map is silently the strict default,
+     which is the failure this namespace spends its whole design avoiding."
+     #{:readers :default :eof}))
 
-  This form is admitted, unlike every other `#` dispatch, because it names no
-  reader -- it is a shorthand for qualification and cannot run anything. Three
-  of this workspace's own resource files use it, so refusing it meant they
-  could never be read by this namespace at all."
-  [ns m]
-  (when (= ns "_") (reject! "EDN namespaced map with _ namespace is forbidden" {}))
-  (reduce-kv
-   (fn [out k v]
-     (assoc out
-            (cond
-              (and (keyword? k) (nil? (namespace k))) (keyword ns (name k))
-              (and (symbol? k) (nil? (namespace k)))  (symbol ns (name k))
-              :else k)
-            v))
-   (empty m) m))
+#?(:clj
+   (defn- check-opts! [opts]
+     (when-not (map? opts) (reject! "EDN options must be a map" {}))
+     (let [unknown (remove option-keys (keys opts))]
+       (when (seq unknown)
+         (reject! "EDN option is not recognised" {:unknown (vec unknown)})))
+     (when (and (contains? opts :default) (not (fn? (:default opts))))
+       (reject! "EDN :default must be a function of [tag value]" {}))
+     (when (and (contains? opts :readers) (not (map? (:readers opts))))
+       (reject! "EDN :readers must be a map of tag symbol to function" {}))
+     opts)
+   :cljs
+   (defn- check-opts! [opts]
+     (when-not (map? opts) (reject! "EDN options must be a map" {}))
+     (let [unknown (remove option-keys (keys opts))]
+       (when (seq unknown)
+         (reject! "EDN option is not recognised" {:unknown (vec unknown)})))
+     (when (and (contains? opts :default) (not (fn? (:default opts))))
+       (reject! "EDN :default must be a function of [tag value]" {}))
+     (when (and (contains? opts :readers) (not (map? (:readers opts))))
+       (reject! "EDN :readers must be a map of tag symbol to function" {}))
+     opts))
 
-(declare read-form)
+#?(:clj
+   (defn read-string
+     "Read the single EDN form in `text`.
+   
+     With one argument nothing is optional and nothing is tagged: reader
+     evaluation and tagged literals are forbidden, and input holding no form is
+     refused. That is the strict default and it has not changed.
+   
+     With an options map first -- `clojure.edn/read-string`'s argument order --
+     three things can be relaxed, each only by naming it:
+   
+       :readers  {tag-symbol (fn [value] ...)}  handlers for specific tags
+       :default  (fn [tag value] ...)           handler for any other tag
+       :eof      value                          returned when there is no form
+   
+     A tagged literal is admitted by the LEXER only when `:readers` or `:default`
+     is present, so the strict default cannot be widened by accident, and a tag
+     with no handler is still refused even when other tags have one.
+   
+     `:eof` exists because the two host readers disagree about it and neither says
+     so. Measured 2026-09-08: `(clojure.edn/read-string {:eof s} \"\")` answers the
+     sentinel on the JVM and `nil` on ClojureScript -- but for whitespace-only and
+     comment-only input BOTH answer the sentinel. So the divergence is not \"cljs
+     ignores :eof\" (which is what the one call site in this workspace had
+     recorded); it is the empty string alone. Here all three answer the sentinel.
+   
+     An option key that is not one of those three is refused, not ignored."
+     ([text] (read-string {} text))
+     ([opts text]
+      (check-opts! opts)
+      (when-not (string? text)
+        (reject! "EDN input must be text" {}))
+      (when (> (utf8-size text) max-edn-bytes)
+        (reject! "EDN input exceeds byte limit" {:limit max-edn-bytes}))
+      (let [tags? (boolean (or (:readers opts) (:default opts)))]
+        ;; "no form" is decided by skipping blanks and comments, not by running
+        ;; the whole lexer -- cheaper, and it does not depend on form-spans, which
+        ;; is defined below and does not model tags.
+        (if (and (contains? opts :eof) (>= (skip-blanks text 0) (count text)))
+          (:eof opts)
+          (do
+            (preflight! text tags?)
+            (try
+              (validate-shape! (read-one text opts))
+              (catch #?(:clj Exception :cljs :default) error
+                (if (= :decode (:phase (ex-data error)))
+                  (throw error)
+                  (throw (ex-info "EDN input was rejected" {:phase :decode} error))))))))))
+   :cljs
+   (defn read-string
+     "Read the single EDN form in `text`.
+   
+     With one argument nothing is optional and nothing is tagged: reader
+     evaluation and tagged literals are forbidden, and input holding no form is
+     refused. That is the strict default and it has not changed.
+   
+     With an options map first -- `clojure.edn/read-string`'s argument order --
+     three things can be relaxed, each only by naming it:
+   
+       :readers  {tag-symbol (fn [value] ...)}  handlers for specific tags
+       :default  (fn [tag value] ...)           handler for any other tag
+       :eof      value                          returned when there is no form
+   
+     A tagged literal is admitted by the LEXER only when `:readers` or `:default`
+     is present, so the strict default cannot be widened by accident, and a tag
+     with no handler is still refused even when other tags have one.
+   
+     `:eof` exists because the two host readers disagree about it and neither says
+     so. Measured 2026-09-08: `(clojure.edn/read-string {:eof s} \"\")` answers the
+     sentinel on the JVM and `nil` on ClojureScript -- but for whitespace-only and
+     comment-only input BOTH answer the sentinel. So the divergence is not \"cljs
+     ignores :eof\" (which is what the one call site in this workspace had
+     recorded); it is the empty string alone. Here all three answer the sentinel.
+   
+     An option key that is not one of those three is refused, not ignored."
+     ([text] (read-string {} text))
+     ([opts text]
+      (check-opts! opts)
+      (when-not (string? text)
+        (reject! "EDN input must be text" {}))
+      (when (> (utf8-size text) max-edn-bytes)
+        (reject! "EDN input exceeds byte limit" {:limit max-edn-bytes}))
+      (let [tags? (boolean (or (:readers opts) (:default opts)))]
+        ;; "no form" is decided by skipping blanks and comments, not by running
+        ;; the whole lexer -- cheaper, and it does not depend on form-spans, which
+        ;; is defined below and does not model tags.
+        (if (and (contains? opts :eof) (>= (skip-blanks text 0) (count text)))
+          (:eof opts)
+          (do
+            (preflight! text tags?)
+            (try
+              (validate-shape! (read-one text opts))
+              (catch #?(:clj Exception :cljs :default) error
+                (if (= :decode (:phase (ex-data error)))
+                  (throw error)
+                  (throw (ex-info "EDN input was rejected" {:phase :decode} error)))))))))))
 
-(defn- read-sequence
-  "Read forms until `close`, returning `[items next-index]`."
-  [text i close opts]
-  (let [n (count text)]
-    (loop [i i items []]
-      (let [i (skip-blanks text i)]
-        (when (>= i n) (reject! "EDN collection is unterminated" {}))
-        (if (= (.charAt ^String text i) close)
-          [items (inc i)]
-          (let [[v i'] (read-form text i opts)]
-            (recur i' (conj items v))))))))
+#?(:clj
+   (def ^:private literal-controls
+     "The C0 controls text keeps literal: tab, newline, carriage return.
+   
+     Not because `pr-str` escapes them inside strings — it does — but because
+     this function takes TEXT, and the whitespace between forms in a
+     pretty-printed artefact is raw code 9/10/13 that no writer touched.
+     Escaping it destroys the document."
+     #{9 10 13})
+   :cljs
+   (def ^:private literal-controls
+     "The C0 controls text keeps literal: tab, newline, carriage return.
+   
+     Not because `pr-str` escapes them inside strings — it does — but because
+     this function takes TEXT, and the whitespace between forms in a
+     pretty-printed artefact is raw code 9/10/13 that no writer touched.
+     Escaping it destroys the document."
+     #{9 10 13}))
 
-(defn- pairs->map
-  "Build the map, small ones as an array-map so SOURCE ORDER SURVIVES.
+#?(:clj
+   (defn escape-controls
+     "Replace every control character in `text` with its `\\uXXXX` escape,
+     except tab, newline and carriage return.
+   
+     ## Why the writer and not a checker
+   
+     A single raw control byte makes `file(1)` classify a file as `data`, and
+     grep then **skips it silently**: `grep -c somename <file>` prints nothing
+     and exits 1 — exactly what a file not containing that name does. Every
+     search-based conclusion about that file is void and nothing says so.
+   
+     Measured 2026-08-18 across this workspace: **20 source and resource files**
+     held raw NUL bytes, and every one of them was there on purpose — a sentinel
+     in a two-pass replace, the start of a regex character range, SQLite magic
+     bytes, a domain separator in a hash input. Three of the twenty were
+     `.kir.edn`, this workspace's canonical IR, and the code they encode is
+     *the null-byte check itself*.
+   
+     They were there on purpose because **`pr-str` emits the raw byte**:
+     `(pr-str (str \"a\" (char 0) \"b\"))` is the five bytes `34 97 0 98 34`. It
+     round-trips, so it is semantically canonical and textually binary.
+   
+     A gate that finds these afterwards leaves a window. A writer that cannot
+     emit one closes it. So this lives here, and the gate becomes a backstop for
+     text that arrived from somewhere else — which is what backstops are for.
+   
+     ## Why this cannot move a CID
+   
+     Identity is over the **value**, and `\\u0000` reads back as the same
+     character, so `read-string` returns an equal value either way. Escaping is a
+     property of the text projection, not of the thing projected. Where something
+     hashes text bytes rather than a value, that is a different decision and this
+     function is not it — pin the digest and prove it, the way
+     `kotoba-lang/rdf-canon` and `kotoba-lang/occupation` did.
+   
+     Total and idempotent: no input produces a raw control byte in the output,
+     and escaping already-escaped text is a no-op.
+   
+     ## Why this is public and not folded into `write-string` alone
+   
+     `write-string` is one writer with a one-line shape and a byte bound.
+     Generated artefacts are written by other writers with other shapes —
+     `clojure.pprint/pprint` for a checked-in KIR file, where the multi-line
+     layout IS the point and a single line would be useless. Measured
+     2026-08-19: `pprint` emits the raw byte exactly as `pr-str` does
+     (`[123 58 115 32 34 97 0 98 34 125 10]`).
+   
+     Those writers need the escaping rule and not this writer. Handing them the
+     function is one definition; leaving them to reimplement it is two that can
+     disagree, which is the defect this library exists to remove."
+     [text]
+     (let [n (count text)]
+       (loop [i 0 acc (transient [])]
+         (if (= i n)
+           (apply str (persistent! acc))
+           (let [c (nth text i)
+                 code #?(:clj (int c) :cljs (.charCodeAt text i))]
+             (recur (inc i)
+                    (conj! acc
+                           ;; Tab, newline and carriage return are LEFT ALONE,
+                           ;; and the reasoning that once removed this exemption
+                           ;; is worth keeping because it was wrong in an
+                           ;; instructive way.
+                           ;;
+                           ;; It ran: `pr-str` already escapes 9, 10 and 13, so
+                           ;; the readable three never reach this loop, so the
+                           ;; exemption is a branch nothing can take — and a
+                           ;; mutation emptying it reddened nothing, which
+                           ;; seemed to confirm it.
+                           ;;
+                           ;; That is true of characters INSIDE a string
+                           ;; literal and false of the whitespace BETWEEN forms.
+                           ;; This function takes text, not a value, so a
+                           ;; pretty-printed artefact arrives with structural
+                           ;; newlines that no writer escaped. Removing the
+                           ;; exemption turned a 16,250-character KIR file into
+                           ;; one line with zero line terminators, and it stopped
+                           ;; parsing: `Map literal must contain an even number
+                           ;; of forms`. Measured 2026-08-19, on the artefact
+                           ;; this escaping exists to fix.
+                           ;;
+                           ;; The mutation had survived because the only caller
+                           ;; under test was `write-string`, whose `pr-str`
+                           ;; output is one line. A live guard was deleted and
+                           ;; called dead code.
+                           (if (and (or (< code 32) (= code 127))
+                                    (not (literal-controls code)))
+                             (str "\\u"
+                                  (let [h #?(:clj (Integer/toHexString code)
+                                             :cljs (.toString code 16))]
+                                    (str (subs "0000" 0 (- 4 (count h))) h)))
+                             c))))))))
+   :cljs
+   (defn escape-controls
+     "Replace every control character in `text` with its `\\uXXXX` escape,
+     except tab, newline and carriage return.
+   
+     ## Why the writer and not a checker
+   
+     A single raw control byte makes `file(1)` classify a file as `data`, and
+     grep then **skips it silently**: `grep -c somename <file>` prints nothing
+     and exits 1 — exactly what a file not containing that name does. Every
+     search-based conclusion about that file is void and nothing says so.
+   
+     Measured 2026-08-18 across this workspace: **20 source and resource files**
+     held raw NUL bytes, and every one of them was there on purpose — a sentinel
+     in a two-pass replace, the start of a regex character range, SQLite magic
+     bytes, a domain separator in a hash input. Three of the twenty were
+     `.kir.edn`, this workspace's canonical IR, and the code they encode is
+     *the null-byte check itself*.
+   
+     They were there on purpose because **`pr-str` emits the raw byte**:
+     `(pr-str (str \"a\" (char 0) \"b\"))` is the five bytes `34 97 0 98 34`. It
+     round-trips, so it is semantically canonical and textually binary.
+   
+     A gate that finds these afterwards leaves a window. A writer that cannot
+     emit one closes it. So this lives here, and the gate becomes a backstop for
+     text that arrived from somewhere else — which is what backstops are for.
+   
+     ## Why this cannot move a CID
+   
+     Identity is over the **value**, and `\\u0000` reads back as the same
+     character, so `read-string` returns an equal value either way. Escaping is a
+     property of the text projection, not of the thing projected. Where something
+     hashes text bytes rather than a value, that is a different decision and this
+     function is not it — pin the digest and prove it, the way
+     `kotoba-lang/rdf-canon` and `kotoba-lang/occupation` did.
+   
+     Total and idempotent: no input produces a raw control byte in the output,
+     and escaping already-escaped text is a no-op.
+   
+     ## Why this is public and not folded into `write-string` alone
+   
+     `write-string` is one writer with a one-line shape and a byte bound.
+     Generated artefacts are written by other writers with other shapes —
+     `clojure.pprint/pprint` for a checked-in KIR file, where the multi-line
+     layout IS the point and a single line would be useless. Measured
+     2026-08-19: `pprint` emits the raw byte exactly as `pr-str` does
+     (`[123 58 115 32 34 97 0 98 34 125 10]`).
+   
+     Those writers need the escaping rule and not this writer. Handing them the
+     function is one definition; leaving them to reimplement it is two that can
+     disagree, which is the defect this library exists to remove."
+     [text]
+     (let [n (count text)]
+       (loop [i 0 acc (transient [])]
+         (if (= i n)
+           (apply str (persistent! acc))
+           (let [c (nth text i)
+                 code #?(:clj (int c) :cljs (.charCodeAt text i))]
+             (recur (inc i)
+                    (conj! acc
+                           ;; Tab, newline and carriage return are LEFT ALONE,
+                           ;; and the reasoning that once removed this exemption
+                           ;; is worth keeping because it was wrong in an
+                           ;; instructive way.
+                           ;;
+                           ;; It ran: `pr-str` already escapes 9, 10 and 13, so
+                           ;; the readable three never reach this loop, so the
+                           ;; exemption is a branch nothing can take — and a
+                           ;; mutation emptying it reddened nothing, which
+                           ;; seemed to confirm it.
+                           ;;
+                           ;; That is true of characters INSIDE a string
+                           ;; literal and false of the whitespace BETWEEN forms.
+                           ;; This function takes text, not a value, so a
+                           ;; pretty-printed artefact arrives with structural
+                           ;; newlines that no writer escaped. Removing the
+                           ;; exemption turned a 16,250-character KIR file into
+                           ;; one line with zero line terminators, and it stopped
+                           ;; parsing: `Map literal must contain an even number
+                           ;; of forms`. Measured 2026-08-19, on the artefact
+                           ;; this escaping exists to fix.
+                           ;;
+                           ;; The mutation had survived because the only caller
+                           ;; under test was `write-string`, whose `pr-str`
+                           ;; output is one line. A live guard was deleted and
+                           ;; called dead code.
+                           (if (and (or (< code 32) (= code 127))
+                                    (not (literal-controls code)))
+                             (str "\\u"
+                                  (let [h #?(:clj (Integer/toHexString code)
+                                             :cljs (.toString code 16))]
+                                    (str (subs "0000" 0 (- 4 (count h))) h)))
+                             c)))))))))
 
-  Not cosmetic. Both host readers do this -- `clojure.edn` hands the pairs to
-  `RT/map`, which returns a PersistentArrayMap at eight entries or fewer -- and
-  `write-string` prints a map in iteration order, so a hash-map here makes
-  read->write reorder the keys of every small map. That breaks textual
-  idempotence, which is exactly the property a `--check` gate over generated
-  text depends on: the file would differ from itself on every regeneration.
-
-  Above eight entries both hosts promote to a hash-map and order is not
-  preserved by anyone, so this matches that too rather than inventing a
-  stronger guarantee than the thing it replaced."
-  [items]
-  (when (odd? (count items))
-    (reject! "EDN map has an odd number of forms" {:count (count items)}))
-  (let [ks (take-nth 2 items)]
-    (when (not= (count ks) (count (set ks)))
-      (reject! "EDN map has a duplicate key" {}))
-    (if (<= (count ks) 8)
-      (apply array-map items)
-      (apply hash-map items))))
-
-(defn- items->set [items]
-  (when (not= (count items) (count (set items)))
-    (reject! "EDN set has a duplicate element" {}))
-  (set items))
-
-(defn- apply-tag
-  "Dispatch one `#tag value`, following clojure.edn: a `:readers` entry wins,
-  then `:default`, and with neither the tag is refused. The strict default --
-  no options at all -- therefore behaves exactly as it did before options
-  existed."
-  [opts tag value]
-  (if-let [reader (get (:readers opts) tag)]
-    (reader value)
-    (if-let [d (:default opts)]
-      (d tag value)
-      (reject! "EDN tagged literal has no reader" {:tag tag}))))
-
-(defn- read-form
-  "`[value next-index]` for the one form starting at `i` (already past blanks)."
-  [text i opts]
-  (let [n (count text)]
-    (when (>= i n) (reject! "EDN input is empty" {}))
-    (let [c (.charAt ^String text i)]
-      (cond
-        (= c "\"") (read-string-literal text i)
-        (= c "\\") (read-char-literal text i)
-
-        (= c "#")
-        (cond
-          (and (< (inc i) n) (= (.charAt ^String text (inc i)) "{"))
-          (let [[items i'] (read-sequence text (+ i 2) "}" opts)]
-            [(items->set items) i'])
-
-          (and (< (inc i) n) (= (.charAt ^String text (inc i)) ":"))
-          (let [brace (loop [j (+ i 2)]
-                        (cond (>= j n) (reject! "EDN namespaced map is unterminated" {})
-                              (= (.charAt ^String text j) "{") j
-                              :else (recur (inc j))))
-                ns    (subs text (+ i 2) brace)
-                [items i'] (read-sequence text (inc brace) "}" opts)]
-            (when (empty? ns) (reject! "EDN namespaced map has no namespace" {}))
-            [(qualify-map ns (pairs->map items)) i'])
-
-          ;; `#tag value` -- only reachable when the caller supplied :readers
-          ;; or :default; preflight refuses the form otherwise.
-          (and (< (inc i) n) (or (:readers opts) (:default opts)))
-          (let [tag-end (token-end text (inc i))
-                tag     (symbol (subs text (inc i) tag-end))
-                vstart  (skip-blanks text tag-end)]
-            (when (>= vstart n)
-              (reject! "EDN tagged literal has no value" {:tag tag}))
-            (let [[v i'] (read-form text vstart opts)]
-              [(apply-tag opts tag v) i']))
-
-          :else (reject! "EDN dispatch forms are forbidden" {}))
-
-        (= c "(") (let [[items i'] (read-sequence text (inc i) ")" opts)] [(apply list items) i'])
-        (= c "[") (let [[items i'] (read-sequence text (inc i) "]" opts)] [items i'])
-        (= c "{") (let [[items i'] (read-sequence text (inc i) "}" opts)] [(pairs->map items) i'])
-
-        (closing? c) (reject! "EDN collection delimiters do not match" {})
-
-        :else (let [j (token-end text i)]
-                (when (= j i) (reject! "EDN token is empty" {}))
-                [(parse-atom (subs text i j)) j])))))
-
-(defn- read-one
-  "The single top-level form in `text`. `preflight!` has already refused empty
-  input and trailing forms, so anything left over here is this parser
-  disagreeing with that lexer -- which is a defect, not bad input, and says so."
-  [text opts]
-  (let [i        (skip-blanks text 0)
-        [v i']   (read-form text i opts)
-        leftover (skip-blanks text i')]
-    (when (< leftover (count text))
-      (reject! "EDN reader and preflight disagree about where the form ends"
-               {:kotoba.lang.edn/reason :reader/desync :index leftover}))
-    v))
-
-(def ^:private option-keys
-  "Every option `read-string`/`read-all` accept. An unknown key is refused
-  rather than ignored: a typo in an option map is silently the strict default,
-  which is the failure this namespace spends its whole design avoiding."
-  #{:readers :default :eof})
-
-(defn- check-opts! [opts]
-  (when-not (map? opts) (reject! "EDN options must be a map" {}))
-  (let [unknown (remove option-keys (keys opts))]
-    (when (seq unknown)
-      (reject! "EDN option is not recognised" {:unknown (vec unknown)})))
-  (when (and (contains? opts :default) (not (fn? (:default opts))))
-    (reject! "EDN :default must be a function of [tag value]" {}))
-  (when (and (contains? opts :readers) (not (map? (:readers opts))))
-    (reject! "EDN :readers must be a map of tag symbol to function" {}))
-  opts)
-
-(defn read-string
-  "Read the single EDN form in `text`.
-
-  With one argument nothing is optional and nothing is tagged: reader
-  evaluation and tagged literals are forbidden, and input holding no form is
-  refused. That is the strict default and it has not changed.
-
-  With an options map first -- `clojure.edn/read-string`'s argument order --
-  three things can be relaxed, each only by naming it:
-
-    :readers  {tag-symbol (fn [value] ...)}  handlers for specific tags
-    :default  (fn [tag value] ...)           handler for any other tag
-    :eof      value                          returned when there is no form
-
-  A tagged literal is admitted by the LEXER only when `:readers` or `:default`
-  is present, so the strict default cannot be widened by accident, and a tag
-  with no handler is still refused even when other tags have one.
-
-  `:eof` exists because the two host readers disagree about it and neither says
-  so. Measured 2026-09-08: `(clojure.edn/read-string {:eof s} \"\")` answers the
-  sentinel on the JVM and `nil` on ClojureScript -- but for whitespace-only and
-  comment-only input BOTH answer the sentinel. So the divergence is not \"cljs
-  ignores :eof\" (which is what the one call site in this workspace had
-  recorded); it is the empty string alone. Here all three answer the sentinel.
-
-  An option key that is not one of those three is refused, not ignored."
-  ([text] (read-string {} text))
-  ([opts text]
-   (check-opts! opts)
-   (when-not (string? text)
-     (reject! "EDN input must be text" {}))
-   (when (> (utf8-size text) max-edn-bytes)
-     (reject! "EDN input exceeds byte limit" {:limit max-edn-bytes}))
-   (let [tags? (boolean (or (:readers opts) (:default opts)))]
-     ;; "no form" is decided by skipping blanks and comments, not by running
-     ;; the whole lexer -- cheaper, and it does not depend on form-spans, which
-     ;; is defined below and does not model tags.
-     (if (and (contains? opts :eof) (>= (skip-blanks text 0) (count text)))
-       (:eof opts)
-       (do
-         (preflight! text tags?)
-         (try
-           (validate-shape! (read-one text opts))
-           (catch #?(:clj Exception :cljs :default) error
-             (if (= :decode (:phase (ex-data error)))
-               (throw error)
-               (throw (ex-info "EDN input was rejected" {:phase :decode} error))))))))))
-
-(def ^:private literal-controls
-  "The C0 controls text keeps literal: tab, newline, carriage return.
-
-  Not because `pr-str` escapes them inside strings — it does — but because
-  this function takes TEXT, and the whitespace between forms in a
-  pretty-printed artefact is raw code 9/10/13 that no writer touched.
-  Escaping it destroys the document."
-  #{9 10 13})
-
-(defn escape-controls
-  "Replace every control character in `text` with its `\\uXXXX` escape,
-  except tab, newline and carriage return.
-
-  ## Why the writer and not a checker
-
-  A single raw control byte makes `file(1)` classify a file as `data`, and
-  grep then **skips it silently**: `grep -c somename <file>` prints nothing
-  and exits 1 — exactly what a file not containing that name does. Every
-  search-based conclusion about that file is void and nothing says so.
-
-  Measured 2026-08-18 across this workspace: **20 source and resource files**
-  held raw NUL bytes, and every one of them was there on purpose — a sentinel
-  in a two-pass replace, the start of a regex character range, SQLite magic
-  bytes, a domain separator in a hash input. Three of the twenty were
-  `.kir.edn`, this workspace's canonical IR, and the code they encode is
-  *the null-byte check itself*.
-
-  They were there on purpose because **`pr-str` emits the raw byte**:
-  `(pr-str (str \"a\" (char 0) \"b\"))` is the five bytes `34 97 0 98 34`. It
-  round-trips, so it is semantically canonical and textually binary.
-
-  A gate that finds these afterwards leaves a window. A writer that cannot
-  emit one closes it. So this lives here, and the gate becomes a backstop for
-  text that arrived from somewhere else — which is what backstops are for.
-
-  ## Why this cannot move a CID
-
-  Identity is over the **value**, and `\\u0000` reads back as the same
-  character, so `read-string` returns an equal value either way. Escaping is a
-  property of the text projection, not of the thing projected. Where something
-  hashes text bytes rather than a value, that is a different decision and this
-  function is not it — pin the digest and prove it, the way
-  `kotoba-lang/rdf-canon` and `kotoba-lang/occupation` did.
-
-  Total and idempotent: no input produces a raw control byte in the output,
-  and escaping already-escaped text is a no-op.
-
-  ## Why this is public and not folded into `write-string` alone
-
-  `write-string` is one writer with a one-line shape and a byte bound.
-  Generated artefacts are written by other writers with other shapes —
-  `clojure.pprint/pprint` for a checked-in KIR file, where the multi-line
-  layout IS the point and a single line would be useless. Measured
-  2026-08-19: `pprint` emits the raw byte exactly as `pr-str` does
-  (`[123 58 115 32 34 97 0 98 34 125 10]`).
-
-  Those writers need the escaping rule and not this writer. Handing them the
-  function is one definition; leaving them to reimplement it is two that can
-  disagree, which is the defect this library exists to remove."
-  [text]
-  (let [n (count text)]
-    (loop [i 0 acc (transient [])]
-      (if (= i n)
-        (apply str (persistent! acc))
-        (let [c (nth text i)
-              code #?(:clj (int c) :cljs (.charCodeAt text i))]
-          (recur (inc i)
-                 (conj! acc
-                        ;; Tab, newline and carriage return are LEFT ALONE,
-                        ;; and the reasoning that once removed this exemption
-                        ;; is worth keeping because it was wrong in an
-                        ;; instructive way.
-                        ;;
-                        ;; It ran: `pr-str` already escapes 9, 10 and 13, so
-                        ;; the readable three never reach this loop, so the
-                        ;; exemption is a branch nothing can take — and a
-                        ;; mutation emptying it reddened nothing, which
-                        ;; seemed to confirm it.
-                        ;;
-                        ;; That is true of characters INSIDE a string
-                        ;; literal and false of the whitespace BETWEEN forms.
-                        ;; This function takes text, not a value, so a
-                        ;; pretty-printed artefact arrives with structural
-                        ;; newlines that no writer escaped. Removing the
-                        ;; exemption turned a 16,250-character KIR file into
-                        ;; one line with zero line terminators, and it stopped
-                        ;; parsing: `Map literal must contain an even number
-                        ;; of forms`. Measured 2026-08-19, on the artefact
-                        ;; this escaping exists to fix.
-                        ;;
-                        ;; The mutation had survived because the only caller
-                        ;; under test was `write-string`, whose `pr-str`
-                        ;; output is one line. A live guard was deleted and
-                        ;; called dead code.
-                        (if (and (or (< code 32) (= code 127))
-                                 (not (literal-controls code)))
-                          (str "\\u"
-                               (let [h #?(:clj (Integer/toHexString code)
-                                          :cljs (.toString code 16))]
-                                 (str (subs "0000" 0 (- 4 (count h))) h)))
-                          c))))))))
-
-(defn write-string
-  "Canonical EDN text for `value`.
-
-  The byte limit is checked **after** escaping, not before: one control
-  character becomes six characters, so a value that passed a pre-escape check
-  could still produce oversized output. The limit is on what is written."
-  [value]
-  (let [text (escape-controls (pr-str (validate-shape! value)))]
-    (when (> (utf8-size text) max-edn-bytes)
-      (reject! "EDN output exceeds byte limit" {:limit max-edn-bytes}))
-    text))
+#?(:clj
+   (defn write-string
+     "Canonical EDN text for `value`.
+   
+     The byte limit is checked **after** escaping, not before: one control
+     character becomes six characters, so a value that passed a pre-escape check
+     could still produce oversized output. The limit is on what is written."
+     [value]
+     (let [text (escape-controls (pr-str (validate-shape! value)))]
+       (when (> (utf8-size text) max-edn-bytes)
+         (reject! "EDN output exceeds byte limit" {:limit max-edn-bytes}))
+       text))
+   :cljs
+   (defn write-string
+     "Canonical EDN text for `value`.
+   
+     The byte limit is checked **after** escaping, not before: one control
+     character becomes six characters, so a value that passed a pre-escape check
+     could still produce oversized output. The limit is on what is written."
+     [value]
+     (let [text (escape-controls (pr-str (validate-shape! value)))]
+       (when (> (utf8-size text) max-edn-bytes)
+         (reject! "EDN output exceeds byte limit" {:limit max-edn-bytes}))
+       text)))
 
 ;; ---------------------------------------------------------------------------
 ;; read-all — the bounded answer to `clojure.edn/read` on a stream
@@ -672,157 +1698,315 @@
 ;; Every bound `read-string` enforces still applies: the whole text is size-
 ;; and syntax-checked once, and each form is shape-checked individually.
 
-(defn- span-reject! [message index]
-  (reject! message {:index index}))
+#?(:clj
+   (defn- span-reject! [message index]
+     (reject! message {:index index}))
+   :cljs
+   (defn- span-reject! [message index]
+     (reject! message {:index index})))
 
-(defn- form-spans
-  "Index spans `[start end)` of each top-level form in `text`, in order.
+#?(:clj
+   (defn- form-spans
+     "Index spans `[start end)` of each top-level form in `text`, in order.
+   
+     Same lexer as `preflight!` (strings, escapes, `;` comments, `#{`, `#:ns{`),
+     but it records where each top-level form begins and ends instead of counting
+     them. Refuses the same malformed input `preflight!` refuses; it does not
+     refuse multiple forms, which is the entire point.
+   
+     `pending` is how a tagged literal stays ONE span: `#a 1` is a tag followed by
+     a value, and the value's end is the form's end, so a span is not closed while
+     a tag is still waiting for one. A completed value RESETS pending rather than
+     decrementing it -- in `#a #b 1` each tag wraps the result of the one inside
+     it, so the single `1` completes both."
+     ([text] (form-spans text false))
+     ([text allow-tags?]
+      (let [n (count text)]
+        (loop [i 0, stack [], token? false, in-string? false, escaped? false,
+               in-comment? false, start nil, spans [], pending 0]
+          (cond
+            (>= i n)
+            (do (when in-string? (span-reject! "EDN string is unterminated" i))
+                (when (seq stack) (span-reject! "EDN collection is unterminated" i))
+                ;; a trailing bare token IS the pending tag's value; a tag with
+                ;; nothing after it is not
+                (when (and (pos? pending) (not token?))
+                  (span-reject! "EDN tagged literal has no value" i))
+                (if start (conj spans [start n]) spans))
+   
+            :else
+            (let [ch    (.charAt ^String text i)
+                  depth (count stack)]
+              (cond
+                in-comment?
+                (recur (inc i) stack token? in-string? false (not= ch "\n") start spans pending)
+   
+                (and in-string? escaped?)
+                (recur (inc i) stack token? true false false start spans pending)
+   
+                (and in-string? (= ch "\\"))
+                (recur (inc i) stack token? true true false start spans pending)
+   
+                in-string?
+                (if (= ch "\"")
+                  (if (zero? depth)
+                    (recur (inc i) stack false false false false nil (conj spans [start (inc i)]) 0)
+                    (recur (inc i) stack false false false false start spans pending))
+                  (recur (inc i) stack token? true false false start spans pending))
+   
+                ;; A bare top-level token ends at the first character that cannot
+                ;; continue it. Close the span and re-process this same character
+                ;; with token? false -- progress is guaranteed because the branch
+                ;; that sent us here cannot be taken twice for one index.
+                (and token? (zero? depth)
+                     (or (separator? ch) (closing? ch) (opening? ch)
+                         (= ch ";") (= ch "\"") (= ch "#")))
+                (recur i stack false false false false nil (conj spans [start i]) 0)
+   
+                (= ch ";")
+                (recur (inc i) stack token? false false true start spans pending)
+   
+                (= ch "\"")
+                (recur (inc i) stack false true false false
+                       (if (zero? depth) (or start i) start) spans pending)
+   
+                (= ch "#")
+                (let [nxt    (when (< (inc i) n) (.charAt ^String text (inc i)))
+                      ns-end (when (= nxt ":")
+                               (loop [j (+ i 2)]
+                                 (cond
+                                   (>= j n) nil
+                                   (= (.charAt ^String text j) "{") j
+                                   (or (separator? (.charAt ^String text j))
+                                       (opening? (.charAt ^String text j))
+                                       (closing? (.charAt ^String text j))) nil
+                                   :else (recur (inc j)))))
+                      brace  (cond (= nxt "{") (inc i)
+                                   ns-end     ns-end)]
+                  (cond
+                    brace
+                    (let [next-stack (conj stack "}")]
+                      (when (> (count next-stack) max-depth)
+                        (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+                      (recur (inc brace) next-stack false false false false
+                             (if (zero? depth) (or start i) start) spans pending))
+   
+                    (and allow-tags? nxt (not (separator? nxt))
+                         (not (opening? nxt)) (not (closing? nxt)))
+                    (recur (loop [j (inc i)]
+                             (if (or (>= j n)
+                                     (separator? (.charAt ^String text j))
+                                     (opening? (.charAt ^String text j))
+                                     (closing? (.charAt ^String text j)))
+                               j
+                               (recur (inc j))))
+                           stack false false false false
+                           (if (zero? depth) (or start i) start) spans
+                           (if (zero? depth) (inc pending) pending))
+   
+                    :else (reject! "EDN dispatch forms are forbidden" {})))
+   
+                (opening? ch)
+                (let [next-stack (conj stack (matching-close ch))]
+                  (when (> (count next-stack) max-depth)
+                    (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+                  (recur (inc i) next-stack false false false false
+                         (if (zero? depth) (or start i) start) spans pending))
+   
+                (closing? ch)
+                (do
+                  (when (or (empty? stack) (not= ch (peek stack)))
+                    (span-reject! "EDN collection delimiters do not match" i))
+                  (let [next-stack (pop stack)]
+                    (if (empty? next-stack)
+                      (recur (inc i) next-stack false false false false nil
+                             (conj spans [start (inc i)]) 0)
+                      (recur (inc i) next-stack false false false false start spans pending))))
+   
+                (separator? ch)
+                (recur (inc i) stack false false false false start spans pending)
+   
+                :else
+                (recur (inc i) stack true false false false
+                       (if (and (zero? depth) (nil? start)) i start) spans pending))))))))
+   :cljs
+   (defn- form-spans
+     "Index spans `[start end)` of each top-level form in `text`, in order.
+   
+     Same lexer as `preflight!` (strings, escapes, `;` comments, `#{`, `#:ns{`),
+     but it records where each top-level form begins and ends instead of counting
+     them. Refuses the same malformed input `preflight!` refuses; it does not
+     refuse multiple forms, which is the entire point.
+   
+     `pending` is how a tagged literal stays ONE span: `#a 1` is a tag followed by
+     a value, and the value's end is the form's end, so a span is not closed while
+     a tag is still waiting for one. A completed value RESETS pending rather than
+     decrementing it -- in `#a #b 1` each tag wraps the result of the one inside
+     it, so the single `1` completes both."
+     ([text] (form-spans text false))
+     ([text allow-tags?]
+      (let [n (count text)]
+        (loop [i 0, stack [], token? false, in-string? false, escaped? false,
+               in-comment? false, start nil, spans [], pending 0]
+          (cond
+            (>= i n)
+            (do (when in-string? (span-reject! "EDN string is unterminated" i))
+                (when (seq stack) (span-reject! "EDN collection is unterminated" i))
+                ;; a trailing bare token IS the pending tag's value; a tag with
+                ;; nothing after it is not
+                (when (and (pos? pending) (not token?))
+                  (span-reject! "EDN tagged literal has no value" i))
+                (if start (conj spans [start n]) spans))
+   
+            :else
+            (let [ch    (.charAt ^String text i)
+                  depth (count stack)]
+              (cond
+                in-comment?
+                (recur (inc i) stack token? in-string? false (not= ch "\n") start spans pending)
+   
+                (and in-string? escaped?)
+                (recur (inc i) stack token? true false false start spans pending)
+   
+                (and in-string? (= ch "\\"))
+                (recur (inc i) stack token? true true false start spans pending)
+   
+                in-string?
+                (if (= ch "\"")
+                  (if (zero? depth)
+                    (recur (inc i) stack false false false false nil (conj spans [start (inc i)]) 0)
+                    (recur (inc i) stack false false false false start spans pending))
+                  (recur (inc i) stack token? true false false start spans pending))
+   
+                ;; A bare top-level token ends at the first character that cannot
+                ;; continue it. Close the span and re-process this same character
+                ;; with token? false -- progress is guaranteed because the branch
+                ;; that sent us here cannot be taken twice for one index.
+                (and token? (zero? depth)
+                     (or (separator? ch) (closing? ch) (opening? ch)
+                         (= ch ";") (= ch "\"") (= ch "#")))
+                (recur i stack false false false false nil (conj spans [start i]) 0)
+   
+                (= ch ";")
+                (recur (inc i) stack token? false false true start spans pending)
+   
+                (= ch "\"")
+                (recur (inc i) stack false true false false
+                       (if (zero? depth) (or start i) start) spans pending)
+   
+                (= ch "#")
+                (let [nxt    (when (< (inc i) n) (.charAt ^String text (inc i)))
+                      ns-end (when (= nxt ":")
+                               (loop [j (+ i 2)]
+                                 (cond
+                                   (>= j n) nil
+                                   (= (.charAt ^String text j) "{") j
+                                   (or (separator? (.charAt ^String text j))
+                                       (opening? (.charAt ^String text j))
+                                       (closing? (.charAt ^String text j))) nil
+                                   :else (recur (inc j)))))
+                      brace  (cond (= nxt "{") (inc i)
+                                   ns-end     ns-end)]
+                  (cond
+                    brace
+                    (let [next-stack (conj stack "}")]
+                      (when (> (count next-stack) max-depth)
+                        (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+                      (recur (inc brace) next-stack false false false false
+                             (if (zero? depth) (or start i) start) spans pending))
+   
+                    (and allow-tags? nxt (not (separator? nxt))
+                         (not (opening? nxt)) (not (closing? nxt)))
+                    (recur (loop [j (inc i)]
+                             (if (or (>= j n)
+                                     (separator? (.charAt ^String text j))
+                                     (opening? (.charAt ^String text j))
+                                     (closing? (.charAt ^String text j)))
+                               j
+                               (recur (inc j))))
+                           stack false false false false
+                           (if (zero? depth) (or start i) start) spans
+                           (if (zero? depth) (inc pending) pending))
+   
+                    :else (reject! "EDN dispatch forms are forbidden" {})))
+   
+                (opening? ch)
+                (let [next-stack (conj stack (matching-close ch))]
+                  (when (> (count next-stack) max-depth)
+                    (reject! "EDN nesting exceeds limit" {:limit max-depth}))
+                  (recur (inc i) next-stack false false false false
+                         (if (zero? depth) (or start i) start) spans pending))
+   
+                (closing? ch)
+                (do
+                  (when (or (empty? stack) (not= ch (peek stack)))
+                    (span-reject! "EDN collection delimiters do not match" i))
+                  (let [next-stack (pop stack)]
+                    (if (empty? next-stack)
+                      (recur (inc i) next-stack false false false false nil
+                             (conj spans [start (inc i)]) 0)
+                      (recur (inc i) next-stack false false false false start spans pending))))
+   
+                (separator? ch)
+                (recur (inc i) stack false false false false start spans pending)
+   
+                :else
+                (recur (inc i) stack true false false false
+                       (if (and (zero? depth) (nil? start)) i start) spans pending)))))))))
 
-  Same lexer as `preflight!` (strings, escapes, `;` comments, `#{`, `#:ns{`),
-  but it records where each top-level form begins and ends instead of counting
-  them. Refuses the same malformed input `preflight!` refuses; it does not
-  refuse multiple forms, which is the entire point.
-
-  `pending` is how a tagged literal stays ONE span: `#a 1` is a tag followed by
-  a value, and the value's end is the form's end, so a span is not closed while
-  a tag is still waiting for one. A completed value RESETS pending rather than
-  decrementing it -- in `#a #b 1` each tag wraps the result of the one inside
-  it, so the single `1` completes both."
-  ([text] (form-spans text false))
-  ([text allow-tags?]
-   (let [n (count text)]
-     (loop [i 0, stack [], token? false, in-string? false, escaped? false,
-            in-comment? false, start nil, spans [], pending 0]
-       (cond
-         (>= i n)
-         (do (when in-string? (span-reject! "EDN string is unterminated" i))
-             (when (seq stack) (span-reject! "EDN collection is unterminated" i))
-             ;; a trailing bare token IS the pending tag's value; a tag with
-             ;; nothing after it is not
-             (when (and (pos? pending) (not token?))
-               (span-reject! "EDN tagged literal has no value" i))
-             (if start (conj spans [start n]) spans))
-
-         :else
-         (let [ch    (.charAt ^String text i)
-               depth (count stack)]
-           (cond
-             in-comment?
-             (recur (inc i) stack token? in-string? false (not= ch "\n") start spans pending)
-
-             (and in-string? escaped?)
-             (recur (inc i) stack token? true false false start spans pending)
-
-             (and in-string? (= ch "\\"))
-             (recur (inc i) stack token? true true false start spans pending)
-
-             in-string?
-             (if (= ch "\"")
-               (if (zero? depth)
-                 (recur (inc i) stack false false false false nil (conj spans [start (inc i)]) 0)
-                 (recur (inc i) stack false false false false start spans pending))
-               (recur (inc i) stack token? true false false start spans pending))
-
-             ;; A bare top-level token ends at the first character that cannot
-             ;; continue it. Close the span and re-process this same character
-             ;; with token? false -- progress is guaranteed because the branch
-             ;; that sent us here cannot be taken twice for one index.
-             (and token? (zero? depth)
-                  (or (separator? ch) (closing? ch) (opening? ch)
-                      (= ch ";") (= ch "\"") (= ch "#")))
-             (recur i stack false false false false nil (conj spans [start i]) 0)
-
-             (= ch ";")
-             (recur (inc i) stack token? false false true start spans pending)
-
-             (= ch "\"")
-             (recur (inc i) stack false true false false
-                    (if (zero? depth) (or start i) start) spans pending)
-
-             (= ch "#")
-             (let [nxt    (when (< (inc i) n) (.charAt ^String text (inc i)))
-                   ns-end (when (= nxt ":")
-                            (loop [j (+ i 2)]
-                              (cond
-                                (>= j n) nil
-                                (= (.charAt ^String text j) "{") j
-                                (or (separator? (.charAt ^String text j))
-                                    (opening? (.charAt ^String text j))
-                                    (closing? (.charAt ^String text j))) nil
-                                :else (recur (inc j)))))
-                   brace  (cond (= nxt "{") (inc i)
-                                ns-end     ns-end)]
-               (cond
-                 brace
-                 (let [next-stack (conj stack "}")]
-                   (when (> (count next-stack) max-depth)
-                     (reject! "EDN nesting exceeds limit" {:limit max-depth}))
-                   (recur (inc brace) next-stack false false false false
-                          (if (zero? depth) (or start i) start) spans pending))
-
-                 (and allow-tags? nxt (not (separator? nxt))
-                      (not (opening? nxt)) (not (closing? nxt)))
-                 (recur (loop [j (inc i)]
-                          (if (or (>= j n)
-                                  (separator? (.charAt ^String text j))
-                                  (opening? (.charAt ^String text j))
-                                  (closing? (.charAt ^String text j)))
-                            j
-                            (recur (inc j))))
-                        stack false false false false
-                        (if (zero? depth) (or start i) start) spans
-                        (if (zero? depth) (inc pending) pending))
-
-                 :else (reject! "EDN dispatch forms are forbidden" {})))
-
-             (opening? ch)
-             (let [next-stack (conj stack (matching-close ch))]
-               (when (> (count next-stack) max-depth)
-                 (reject! "EDN nesting exceeds limit" {:limit max-depth}))
-               (recur (inc i) next-stack false false false false
-                      (if (zero? depth) (or start i) start) spans pending))
-
-             (closing? ch)
-             (do
-               (when (or (empty? stack) (not= ch (peek stack)))
-                 (span-reject! "EDN collection delimiters do not match" i))
-               (let [next-stack (pop stack)]
-                 (if (empty? next-stack)
-                   (recur (inc i) next-stack false false false false nil
-                          (conj spans [start (inc i)]) 0)
-                   (recur (inc i) next-stack false false false false start spans pending))))
-
-             (separator? ch)
-             (recur (inc i) stack false false false false start spans pending)
-
-             :else
-             (recur (inc i) stack true false false false
-                    (if (and (zero? depth) (nil? start)) i start) spans pending))))))))
-
-(defn read-all
-  "Read EVERY top-level form in `text`, returning a vector in source order.
-
-  The bounded, capability-free replacement for a `clojure.edn/read` loop over
-  a `PushbackReader` with an `:eof` sentinel: obtain the text through a granted
-  filesystem handle, then call this. End of input is the end of the vector, so
-  there is no sentinel value to choose or to leak into the data.
-
-  Empty input (blank, or only comments) reads as `[]` -- NOT an error, because
-  `[]` is the honest answer for a file that holds no forms, and the caller can
-  tell it apart from a file it failed to read (that throws). Each form is
-  bounded and shape-checked exactly as `read-string` bounds a single one.
-
-  Reader evaluation and tagged literals stay forbidden."
-  ([text] (read-all {} text))
-  ([opts text]
-   (check-opts! opts)
-   (when-not (string? text)
-     (reject! "EDN input must be text" {}))
-   (when (> (utf8-size text) max-edn-bytes)
-     (reject! "EDN input exceeds byte limit" {:limit max-edn-bytes}))
-   ;; :eof has no meaning here -- end of input is the end of the vector, which
-   ;; is the whole point of read-all -- so it is refused rather than ignored.
-   (when (contains? opts :eof)
-     (reject! "EDN :eof has no meaning for read-all; the empty vector is the answer" {}))
-   (mapv (fn [[start end]] (read-string opts (subs text start end)))
-         (form-spans text (boolean (or (:readers opts) (:default opts)))))))
+#?(:clj
+   (defn read-all
+     "Read EVERY top-level form in `text`, returning a vector in source order.
+   
+     The bounded, capability-free replacement for a `clojure.edn/read` loop over
+     a `PushbackReader` with an `:eof` sentinel: obtain the text through a granted
+     filesystem handle, then call this. End of input is the end of the vector, so
+     there is no sentinel value to choose or to leak into the data.
+   
+     Empty input (blank, or only comments) reads as `[]` -- NOT an error, because
+     `[]` is the honest answer for a file that holds no forms, and the caller can
+     tell it apart from a file it failed to read (that throws). Each form is
+     bounded and shape-checked exactly as `read-string` bounds a single one.
+   
+     Reader evaluation and tagged literals stay forbidden."
+     ([text] (read-all {} text))
+     ([opts text]
+      (check-opts! opts)
+      (when-not (string? text)
+        (reject! "EDN input must be text" {}))
+      (when (> (utf8-size text) max-edn-bytes)
+        (reject! "EDN input exceeds byte limit" {:limit max-edn-bytes}))
+      ;; :eof has no meaning here -- end of input is the end of the vector, which
+      ;; is the whole point of read-all -- so it is refused rather than ignored.
+      (when (contains? opts :eof)
+        (reject! "EDN :eof has no meaning for read-all; the empty vector is the answer" {}))
+      (mapv (fn [[start end]] (read-string opts (subs text start end)))
+            (form-spans text (boolean (or (:readers opts) (:default opts)))))))
+   :cljs
+   (defn read-all
+     "Read EVERY top-level form in `text`, returning a vector in source order.
+   
+     The bounded, capability-free replacement for a `clojure.edn/read` loop over
+     a `PushbackReader` with an `:eof` sentinel: obtain the text through a granted
+     filesystem handle, then call this. End of input is the end of the vector, so
+     there is no sentinel value to choose or to leak into the data.
+   
+     Empty input (blank, or only comments) reads as `[]` -- NOT an error, because
+     `[]` is the honest answer for a file that holds no forms, and the caller can
+     tell it apart from a file it failed to read (that throws). Each form is
+     bounded and shape-checked exactly as `read-string` bounds a single one.
+   
+     Reader evaluation and tagged literals stay forbidden."
+     ([text] (read-all {} text))
+     ([opts text]
+      (check-opts! opts)
+      (when-not (string? text)
+        (reject! "EDN input must be text" {}))
+      (when (> (utf8-size text) max-edn-bytes)
+        (reject! "EDN input exceeds byte limit" {:limit max-edn-bytes}))
+      ;; :eof has no meaning here -- end of input is the end of the vector, which
+      ;; is the whole point of read-all -- so it is refused rather than ignored.
+      (when (contains? opts :eof)
+        (reject! "EDN :eof has no meaning for read-all; the empty vector is the answer" {}))
+      (mapv (fn [[start end]] (read-string opts (subs text start end)))
+            (form-spans text (boolean (or (:readers opts) (:default opts))))))))
