@@ -210,10 +210,10 @@
     (loop [i i]
       (cond
         (>= i n) i
-        (separator? (.charAt ^String text i)) (recur (inc i))
-        (= (.charAt ^String text i) ";")
+        (separator? (char-at text i)) (recur (inc i))
+        (= (char-at text i) ";")
         (recur (loop [j i]
-                 (if (or (>= j n) (= (.charAt ^String text j) "\n")) j (recur (inc j)))))
+                 (if (or (>= j n) (= (char-at text j) "\n")) j (recur (inc j)))))
         :else i))))
 
 (defn- read-string-literal
@@ -222,12 +222,12 @@
   (let [n (count text)]
     (loop [j (inc i) out []]
       (when (>= j n) (reject! "EDN string is unterminated" {}))
-      (let [c (.charAt ^String text j)]
+      (let [c (char-at text j)]
         (cond
           (= c "\"") [(apply str out) (inc j)]
 
           (= c "\\")
-          (let [e (when (< (inc j) n) (.charAt ^String text (inc j)))]
+          (let [e (when (< (inc j) n) (char-at text (inc j)))]
             (cond
               (= e "\"") (recur (+ j 2) (conj out "\""))
               (= e "\\") (recur (+ j 2) (conj out "\\"))
@@ -260,7 +260,7 @@
   (let [n (count text)]
     (when (>= (inc i) n) (reject! "EDN character literal is empty" {}))
     (let [j   (loop [j (+ i 2)]
-                (if (and (< j n) (alphanumeric? (.charAt ^String text j)))
+                (if (and (< j n) (alphanumeric? (char-at text j)))
                   (recur (inc j)) j))
           tok (subs text (inc i) j)]
       (cond
@@ -275,11 +275,11 @@
   (let [n (count text)]
     (loop [j i]
       (if (or (>= j n)
-              (separator? (.charAt ^String text j))
-              (opening? (.charAt ^String text j))
-              (closing? (.charAt ^String text j))
-              (= (.charAt ^String text j) "\"")
-              (= (.charAt ^String text j) ";"))
+              (separator? (char-at text j))
+              (opening? (char-at text j))
+              (closing? (char-at text j))
+              (= (char-at text j) "\"")
+              (= (char-at text j) ";"))
         j
         (recur (inc j))))))
 
@@ -295,7 +295,7 @@
     (re-matches #"[+-]?[0-9]+/[0-9]+" tok)                 (refuse-imprecise! tok :number/ratio)
 
     (re-matches #"[+-]?[0-9]+" tok)
-    (let [magnitude (if (or (= "+" (.charAt ^String tok 0)) (= "-" (.charAt ^String tok 0)))
+    (let [magnitude (if (or (= "+" (char-at tok 0)) (= "-" (char-at tok 0)))
                       (subs tok 1) tok)]
       ;; length first: a 400-digit literal must not be converted before it is
       ;; range-checked, or the conversion itself is the thing that loses it
@@ -316,7 +316,7 @@
     (= tok "true")  true
     (= tok "false") false
 
-    (= (.charAt ^String tok 0) ":")
+    (= (char-at tok 0) ":")
     (cond
       (= tok ":")                  (reject! "EDN keyword is empty" {})
       (= (subs tok 0 (min 2 (count tok))) "::")
@@ -362,7 +362,7 @@
     (loop [i i items []]
       (let [i (skip-blanks text i)]
         (when (>= i n) (reject! "EDN collection is unterminated" {}))
-        (if (= (.charAt ^String text i) close)
+        (if (= (char-at text i) close)
           [items (inc i)]
           (let [[v i'] (read-form text i opts)]
             (recur i' (conj items v))))))))
@@ -412,21 +412,21 @@
   [text i opts]
   (let [n (count text)]
     (when (>= i n) (reject! "EDN input is empty" {}))
-    (let [c (.charAt ^String text i)]
+    (let [c (char-at text i)]
       (cond
         (= c "\"") (read-string-literal text i)
         (= c "\\") (read-char-literal text i)
 
         (= c "#")
         (cond
-          (and (< (inc i) n) (= (.charAt ^String text (inc i)) "{"))
+          (and (< (inc i) n) (= (char-at text (inc i)) "{"))
           (let [[items i'] (read-sequence text (+ i 2) "}" opts)]
             [(items->set items) i'])
 
-          (and (< (inc i) n) (= (.charAt ^String text (inc i)) ":"))
+          (and (< (inc i) n) (= (char-at text (inc i)) ":"))
           (let [brace (loop [j (+ i 2)]
                         (cond (>= j n) (reject! "EDN namespaced map is unterminated" {})
-                              (= (.charAt ^String text j) "{") j
+                              (= (char-at text j) "{") j
                               :else (recur (inc j))))
                 ns    (subs text (+ i 2) brace)
                 [items i'] (read-sequence text (inc brace) "}" opts)]
@@ -716,7 +716,7 @@
              (if start (conj spans [start n]) spans))
 
          :else
-         (let [ch    (.charAt ^String text i)
+         (let [ch    (char-at text i)
                depth (count stack)]
            (cond
              in-comment?
@@ -752,15 +752,15 @@
                     (if (zero? depth) (or start i) start) spans pending)
 
              (= ch "#")
-             (let [nxt    (when (< (inc i) n) (.charAt ^String text (inc i)))
+             (let [nxt    (when (< (inc i) n) (char-at text (inc i)))
                    ns-end (when (= nxt ":")
                             (loop [j (+ i 2)]
                               (cond
                                 (>= j n) nil
-                                (= (.charAt ^String text j) "{") j
-                                (or (separator? (.charAt ^String text j))
-                                    (opening? (.charAt ^String text j))
-                                    (closing? (.charAt ^String text j))) nil
+                                (= (char-at text j) "{") j
+                                (or (separator? (char-at text j))
+                                    (opening? (char-at text j))
+                                    (closing? (char-at text j))) nil
                                 :else (recur (inc j)))))
                    brace  (cond (= nxt "{") (inc i)
                                 ns-end     ns-end)]
@@ -776,9 +776,9 @@
                       (not (opening? nxt)) (not (closing? nxt)))
                  (recur (loop [j (inc i)]
                           (if (or (>= j n)
-                                  (separator? (.charAt ^String text j))
-                                  (opening? (.charAt ^String text j))
-                                  (closing? (.charAt ^String text j)))
+                                  (separator? (char-at text j))
+                                  (opening? (char-at text j))
+                                  (closing? (char-at text j)))
                             j
                             (recur (inc j))))
                         stack false false false false
